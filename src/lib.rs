@@ -23,6 +23,7 @@ pub enum ControlMessage {
     TogglePause,
     Speed(i8),
     ResetSpeed,
+    Glitch { x: u16, y: u16 },
 }
 
 pub struct SharedStreamState {
@@ -141,6 +142,9 @@ fn spawn_simulation_task(
                             speed_step = 16;
                             ticker = interval(tick_duration(base_fps, speed_step));
                         }
+                        ControlMessage::Glitch { x, y } => {
+                            simulation.queue_glitch(x, y);
+                        }
                     }
                 }
                 _ = ticker.tick() => {
@@ -159,7 +163,8 @@ fn spawn_simulation_task(
                         last_resize_check = Instant::now();
                     }
 
-                    let mut frame = simulation.tick();
+                    let dt_ms = tick_duration(base_fps, speed_step).as_secs_f32() * 1000.0;
+                    let mut frame = simulation.tick_with_dt(dt_ms);
                     frame.speed_step = speed_step as u8;
                     telemetry.increment_frames();
                     {

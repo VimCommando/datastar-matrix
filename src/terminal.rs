@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use crossterm::ExecutableCommand;
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, size,
 };
@@ -40,6 +40,9 @@ pub fn run_terminal(
     stdout
         .execute(EnterAlternateScreen)
         .context("failed to enter alternate screen")?;
+    stdout
+        .execute(EnableMouseCapture)
+        .context("failed to enable mouse capture")?;
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("failed to create terminal")?;
@@ -47,6 +50,7 @@ pub fn run_terminal(
     let result = run_loop(&mut terminal, &mut rx, &token, &telemetry, &control_tx);
 
     disable_raw_mode().ok();
+    terminal.backend_mut().execute(DisableMouseCapture).ok();
     terminal.backend_mut().execute(LeaveAlternateScreen).ok();
     terminal.show_cursor().ok();
 
@@ -140,8 +144,8 @@ fn run_loop(
         })?;
 
         if event::poll(Duration::from_millis(16)).context("event poll failed")? {
-            if let Event::Key(key) = event::read().context("event read failed")? {
-                match key.code {
+            match event::read().context("event read failed")? {
+                Event::Key(key) => match key.code {
                     KeyCode::Char('?') => show_overlay = !show_overlay,
                     KeyCode::Char('q') => return Ok(()),
                     KeyCode::Char('+') => {
@@ -160,7 +164,16 @@ fn run_loop(
                         return Ok(());
                     }
                     _ => {}
+                },
+                Event::Mouse(mouse) => {
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                        let _ = control_tx.send(ControlMessage::Glitch {
+                            x: mouse.column,
+                            y: mouse.row,
+                        });
+                    }
                 }
+                _ => {}
             }
         }
     }

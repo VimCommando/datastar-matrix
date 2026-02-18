@@ -72,7 +72,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
 </head>
 <body>
   <div class="wrap">
-    <canvas id="matrix"></canvas>
+    <canvas id="matrix" data-on:mousedown="window.__matrixDatastar.onClick(evt)"></canvas>
     <div id="stats"></div>
     <div id="disc">[ Disconnected ]</div>
     <div
@@ -253,6 +253,22 @@ const INDEX_HTML: &str = r#"<!doctype html>
           body: JSON.stringify({ cols, rows }),
         }).catch(() => {});
       },
+      onClick(evt) {
+        const rect = matrix.getBoundingClientRect();
+        const px = evt.clientX - rect.left;
+        const py = evt.clientY - rect.top;
+        let x = Math.floor(px / CELL_W);
+        let y = Math.floor(py / CELL_H);
+        const maxX = Math.max(0, canvasW - 1);
+        const maxY = Math.max(0, canvasH - 1);
+        x = Math.max(0, Math.min(maxX, x));
+        y = Math.max(0, Math.min(maxY, y));
+        fetch('/cmd/glitch', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ x, y }),
+        }).catch(() => {});
+      },
     };
     scheduleDisconnect();
   </script>
@@ -354,6 +370,15 @@ fn datastar_signal_event(
     })
     .to_string();
     PatchSignals::new(signals).write_as_axum_sse_event()
+}
+
+fn clamp_glitch_to_frame(glitch: GlitchBody, frame: &FrameEvent) -> (u16, u16) {
+    let max_x = frame.width.saturating_sub(1) as i32;
+    let max_y = frame.height.saturating_sub(1) as i32;
+    (
+        glitch.x.clamp(0, max_x) as u16,
+        glitch.y.clamp(0, max_y) as u16,
+    )
 }
 
 pub fn spawn_server(
@@ -503,7 +528,7 @@ fn events_datastar_inner(
 async fn cmd(
     State(state): State<AppState>,
     Path(op): Path<String>,
-    body: Option<Json<ViewportBody>>,
+    body: Option<Json<CmdBody>>,
 ) -> StatusCode {
     match op.as_str() {
         "toggle_pause" => {
@@ -519,10 +544,15 @@ async fn cmd(
             let _ = state.shared.control_tx.send(ControlMessage::ResetSpeed);
         }
         "resize" => {
-            if let Some(Json(vp)) = body {
-                if let (Some(cols), Some(rows)) = (vp.cols, vp.rows) {
-                    let _ = state.shared.resize_tx.send((cols.max(1), rows.max(1)));
-                }
+            if let Some(Json(CmdBody::Resize(vp))) = body {
+                let _ = state.shared.resize_tx.send((vp.cols.max(1), vp.rows.max(1)));
+            }
+        }
+        "glitch" => {
+            if let Some(Json(CmdBody::Glitch(glitch))) = body {
+                let latest = state.shared.latest.read().await.clone();
+                let (x, y) = clamp_glitch_to_frame(glitch, &latest);
+                let _ = state.shared.control_tx.send(ControlMessage::Glitch { x, y });
             }
         }
         _ => {}
@@ -540,6 +570,25 @@ struct ViewportQuery {
 struct ViewportBody {
     cols: Option<u16>,
     rows: Option<u16>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(untagged)]
+enum CmdBody {
+    Resize(ResizeBody),
+    Glitch(GlitchBody),
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ResizeBody {
+    cols: u16,
+    rows: u16,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GlitchBody {
+    x: i32,
+    y: i32,
 }
 
 #[cfg(test)]
@@ -593,5 +642,19 @@ mod tests {
     fn browser_markup_contains_stale_and_disconnect_logic() {
         assert!(INDEX_HTML.contains("if (frameId <= lastRenderedFrame) return;"));
         assert!(INDEX_HTML.contains("setTimeout(() => { disc.style.display = 'flex'; }, 3000)"));
+    }
+
+    #[test]
+    fn glitch_coords_are_clamped_to_latest_frame() {
+        let frame = FrameEvent {
+            frame_id: 1,
+            speed_step: 16,
+            width: 10,
+            height: 5,
+            kind: FrameKind::Keyframe,
+            cells: vec![],
+        };
+        let (x, y) = clamp_glitch_to_frame(GlitchBody { x: -5, y: 500 }, &frame);
+        assert_eq!((x, y), (0, 4));
     }
 }

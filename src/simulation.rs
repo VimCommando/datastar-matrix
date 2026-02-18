@@ -9,6 +9,12 @@ pub const ALPHA_WEIGHT: u32 = 20;
 pub const KATAKANA_WEIGHT: u32 = 20;
 const KEYFRAME_INTERVAL: u64 = 30;
 const GLYPH_HOLD_PROBABILITY: f64 = 0.90;
+const RIPPLE_DURATION_MS: f32 = 750.0;
+const RIPPLE_BRIGHT_HOLD_MS: f32 = 400.0;
+const RIPPLE_MAX_RADIUS: f32 = 16.0;
+const RIPPLE_BAND_WIDTH: f32 = 2.0;
+const RIPPLE_GLYPH_BASE_PROB: f32 = 0.15;
+const RIPPLE_GLYPH_MAX_PROB: f32 = 0.80;
 
 const NUMERIC_START: u8 = 1;
 const NUMERIC_LEN: u8 = 10;
@@ -24,6 +30,13 @@ struct Column {
     stride: u8,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct Ripple {
+    origin_x: u16,
+    origin_y: u16,
+    age_ms: f32,
+}
+
 #[derive(Debug)]
 pub struct Simulation {
     width: u16,
@@ -35,6 +48,8 @@ pub struct Simulation {
     prev_glyph: Vec<u8>,
     grid_lum: Vec<u8>,
     prev_lum: Vec<u8>,
+    ripples: Vec<Ripple>,
+    pending_glitch: Option<(u16, u16)>,
 }
 
 impl Simulation {
@@ -51,6 +66,8 @@ impl Simulation {
             prev_glyph: vec![SPACE_GLYPH; width as usize * height as usize],
             grid_lum: vec![0; width as usize * height as usize],
             prev_lum: vec![0; width as usize * height as usize],
+            ripples: Vec::new(),
+            pending_glitch: None,
         };
         sim.reseed_columns();
         sim
@@ -116,6 +133,16 @@ impl Simulation {
     }
 
     pub fn tick(&mut self) -> FrameEvent {
+        self.tick_with_dt(1000.0 / self.fps.max(1.0))
+    }
+
+    pub fn queue_glitch(&mut self, x: u16, y: u16) {
+        if self.pending_glitch.is_none() {
+            self.pending_glitch = Some((x.min(self.width.saturating_sub(1)), y.min(self.height.saturating_sub(1))));
+        }
+    }
+
+    pub fn tick_with_dt(&mut self, dt_ms: f32) -> FrameEvent {
         self.frame_id += 1;
         self.prev_glyph.copy_from_slice(&self.grid_glyph);
         self.prev_lum.copy_from_slice(&self.grid_lum);
@@ -123,6 +150,13 @@ impl Simulation {
         self.grid_lum.fill(0);
 
         let mut rng = rand::rng();
+        if let Some((x, y)) = self.pending_glitch.take() {
+            self.ripples.push(Ripple {
+                origin_x: x,
+                origin_y: y,
+                age_ms: 0.0,
+            });
+        }
         for (x, col) in self.columns.iter_mut().enumerate() {
             if self.frame_id % col.stride as u64 == 0 {
                 col.head += 1;
@@ -149,6 +183,11 @@ impl Simulation {
                 }
             }
         }
+        self.apply_ripples(&mut rng);
+        for ripple in &mut self.ripples {
+            ripple.age_ms += dt_ms.max(0.0);
+        }
+        self.ripples.retain(|r| r.age_ms < RIPPLE_DURATION_MS);
 
         let kind = if self.frame_id % KEYFRAME_INTERVAL == 0 {
             FrameKind::Keyframe
@@ -189,6 +228,67 @@ impl Simulation {
             height: self.height,
             kind,
             cells,
+        }
+    }
+
+    fn apply_ripples(&mut self, rng: &mut impl Rng) {
+        if self.ripples.is_empty() || self.width == 0 || self.height == 0 {
+            return;
+        }
+
+        let width = self.width as usize;
+        for ripple in &self.ripples {
+            let age_norm = (ripple.age_ms / RIPPLE_DURATION_MS).clamp(0.0, 1.0);
+            if age_norm >= 1.0 {
+                continue;
+            }
+            let radius = RIPPLE_MAX_RADIUS * age_norm;
+            let fade = if ripple.age_ms <= RIPPLE_BRIGHT_HOLD_MS {
+                1.0
+            } else {
+                let tail = (ripple.age_ms - RIPPLE_BRIGHT_HOLD_MS)
+                    / (RIPPLE_DURATION_MS - RIPPLE_BRIGHT_HOLD_MS);
+                (1.0 - tail).clamp(0.0, 1.0)
+            };
+            let min_x = (ripple.origin_x as i32 - (radius + RIPPLE_BAND_WIDTH).ceil() as i32).max(0);
+            let max_x = (ripple.origin_x as i32 + (radius + RIPPLE_BAND_WIDTH).ceil() as i32)
+                .min(self.width as i32 - 1);
+            let min_y = (ripple.origin_y as i32 - (radius + RIPPLE_BAND_WIDTH).ceil() as i32).max(0);
+            let max_y = (ripple.origin_y as i32 + (radius + RIPPLE_BAND_WIDTH).ceil() as i32)
+                .min(self.height as i32 - 1);
+
+            for y in min_y..=max_y {
+                for x in min_x..=max_x {
+                    let dx = x as f32 - ripple.origin_x as f32;
+                    let dy = y as f32 - ripple.origin_y as f32;
+                    let dist = (dx * dx + dy * dy).sqrt();
+                    if dist > RIPPLE_MAX_RADIUS {
+                        continue;
+                    }
+                    let band_dist = (dist - radius).abs();
+                    if band_dist > RIPPLE_BAND_WIDTH {
+                        continue;
+                    }
+                    let band = 1.0 - (band_dist / RIPPLE_BAND_WIDTH);
+                    let strength = (band * fade).clamp(0.0, 1.0);
+                    if strength <= 0.0 {
+                        continue;
+                    }
+                    let idx = y as usize * width + x as usize;
+                    let lum = if ripple.age_ms <= RIPPLE_BRIGHT_HOLD_MS && band > 0.75 {
+                        u8::MAX
+                    } else {
+                        let boost = (strength * 140.0).round() as i32;
+                        (self.grid_lum[idx] as i32 + boost).clamp(0, u8::MAX as i32) as u8
+                    };
+                    self.grid_lum[idx] = lum;
+
+                    let replace_p = RIPPLE_GLYPH_BASE_PROB + (RIPPLE_GLYPH_MAX_PROB - RIPPLE_GLYPH_BASE_PROB) * strength;
+                    if rng.random_bool(replace_p as f64) {
+                        self.grid_glyph[idx] = sample_glyph_index(rng);
+                    }
+                }
+            }
         }
     }
 
@@ -287,5 +387,66 @@ mod tests {
         sim.grow_to_fit(40, 15);
         assert_eq!(sim.width, 40);
         assert_eq!(sim.height, 15);
+    }
+
+    #[test]
+    fn glitch_spawns_at_most_one_per_tick() {
+        let mut sim = Simulation::new(10, 10, 60.0);
+        sim.queue_glitch(1, 1);
+        sim.queue_glitch(2, 2);
+        let _ = sim.tick_with_dt(16.0);
+        assert_eq!(sim.ripples.len(), 1);
+    }
+
+    #[test]
+    fn ripple_expires_after_duration() {
+        let mut sim = Simulation::new(10, 10, 60.0);
+        sim.queue_glitch(5, 5);
+        let _ = sim.tick_with_dt(16.0);
+        assert!(!sim.ripples.is_empty());
+        let _ = sim.tick_with_dt(900.0);
+        assert!(sim.ripples.is_empty());
+    }
+
+    #[test]
+    fn ripple_changes_luminance_or_glyph() {
+        let mut sim = Simulation::new(20, 10, 60.0);
+        let before = sim.tick_with_dt(16.0);
+        sim.queue_glitch(10, 5);
+        let after = sim.tick_with_dt(16.0);
+        let before_nonzero = before.cells.iter().filter(|c| c.lum > 0).count();
+        let after_nonzero = after.cells.iter().filter(|c| c.lum > 0).count();
+        assert!(after_nonzero >= before_nonzero);
+    }
+
+    #[test]
+    fn ripple_never_reaches_beyond_max_radius() {
+        let mut sim = Simulation::new(40, 3, 60.0);
+        sim.columns.clear();
+        sim.ripples.push(Ripple {
+            origin_x: 0,
+            origin_y: 0,
+            age_ms: 499.0,
+        });
+        let frame = sim.tick_with_dt(1.0);
+        let affected_17 = frame
+            .cells
+            .iter()
+            .any(|c| c.x == 17 && c.y == 0 && (c.lum > 0 || c.glyph != SPACE_GLYPH));
+        assert!(!affected_17);
+    }
+
+    #[test]
+    fn leading_edge_is_full_bright_during_hold_window() {
+        let mut sim = Simulation::new(30, 5, 60.0);
+        sim.columns.clear();
+        sim.ripples.push(Ripple {
+            origin_x: 10,
+            origin_y: 2,
+            age_ms: 300.0,
+        });
+        let frame = sim.tick_with_dt(1.0);
+        let bright = frame.cells.iter().any(|c| c.lum == 255);
+        assert!(bright);
     }
 }
