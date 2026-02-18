@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use anyhow::Context;
 use async_stream::stream;
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
+use axum::Json;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse};
 use axum::http::StatusCode;
@@ -13,10 +14,13 @@ use axum::routing::{get, post};
 use axum::Router;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use datastar::prelude::PatchSignals;
+use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tower_http::compression::CompressionLayer;
 
 use crate::SharedStreamState;
 use crate::frame::{FrameEvent, FrameKind};
@@ -29,6 +33,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>datastar-matrix</title>
+  <script type="module" src="https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.0-RC.7/bundles/datastar.js"></script>
   <style>
     :root {
       --bg: #000;
@@ -44,19 +49,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .wrap { position: relative; width: 100vw; height: 100vh; overflow: hidden; }
     #matrix {
       margin: 0;
-      white-space: pre;
-      font-size: 12pt;
-      line-height: 1;
-      font-variant-ligatures: none;
-      font-feature-settings: "liga" 0, "calt" 0;
-      letter-spacing: 0;
-    }
-    .cell {
-      display: inline-block;
-      width: 1ch;
-      text-align: center;
-      overflow: hidden;
-      vertical-align: top;
+      display: block;
+      width: 100%;
+      height: 100%;
     }
     #disc { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; color: var(--disc); font-size: 22px; }
     #stats {
@@ -73,47 +68,77 @@ const INDEX_HTML: &str = r#"<!doctype html>
       white-space: nowrap;
       text-align: right;
     }
-    .g0 { color: var(--g0); text-shadow: 0 0 6px rgba(0, 255, 0, 0.45); }
-    .g1 { color: var(--g1); }
-    .g2 { color: var(--g2); }
-    .g3 { color: var(--g3); }
-    .g4 { color: var(--g4); }
-    .g5 { color: var(--g5); }
   </style>
 </head>
 <body>
   <div class="wrap">
-    <pre id="matrix"></pre>
+    <canvas id="matrix"></canvas>
     <div id="stats"></div>
     <div id="disc">[ Disconnected ]</div>
+    <div
+      id="ds"
+      data-signals="{frameId: 0, speed: 16, sentMs: 0, connected: false, packedB64: '', cols: Math.max(1, Math.ceil(window.innerWidth / 10)), rows: Math.max(1, Math.ceil(window.innerHeight / 20)), width: Math.max(1, Math.ceil(window.innerWidth / 10)), height: Math.max(1, Math.ceil(window.innerHeight / 20))}"
+      data-init="@patch('/events', {cols: $cols, rows: $rows})"
+      data-effect="window.__matrixDatastar.onFrame($frameId, $speed, $sentMs, $packedB64, $width, $height)"
+      data-on:keydown__window="window.__matrixDatastar.onKey(evt)"
+      data-on:resize__window__debounce.1s="$cols = Math.max(1, Math.ceil(window.innerWidth / 10)); $rows = Math.max(1, Math.ceil(window.innerHeight / 20)); $width = $cols; $height = $rows; window.__matrixDatastar.onResize($cols, $rows)"
+    ></div>
   </div>
   <script>
-    const signals = { frameId: 0, speed: 16, w: 0, h: 0, buf: [], lum: [] };
-    const glyphs = [
+    const CELL_W = 10;
+    const CELL_H = 20;
+    const FONT = '12pt "Osaka-Mono", "MS Gothic", "Noto Sans Mono CJK JP", "Menlo", "Monaco", monospace';
+    const GLYPHS = [
       ' ','0','1','2','3','4','5','6','7','8','9','A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P','Q','R','S','T','U','V','W','X','Y','Z',
       'ｱ','ｲ','ｳ','ｴ','ｵ','ｶ','ｷ','ｸ','ｹ','ｺ','ｻ','ｼ','ｽ','ｾ','ｿ','ﾀ','ﾁ','ﾂ','ﾃ','ﾄ','ﾅ','ﾆ','ﾇ','ﾈ','ﾉ','ﾊ','ﾋ','ﾌ','ﾍ','ﾎ','ﾏ','ﾐ','ﾑ','ﾒ','ﾓ','ﾔ','ﾕ','ﾖ','ﾗ','ﾘ','ﾙ','ﾚ','ﾛ','ﾜ','ﾝ'
     ];
     const matrix = document.getElementById('matrix');
+    const ctx = matrix.getContext('2d', { alpha: false, desynchronized: true });
     const stats = document.getElementById('stats');
     const disc = document.getElementById('disc');
     let timeoutHandle;
     let showStats = false;
+    let lastFrameId = 0;
+    let lastRenderedFrame = 0;
+    let lastSpeed = 16;
+    let lastSentMs = 0;
     let fps = 0;
     let fpsLastFrame = 0;
     let fpsLastAt = performance.now();
     let latencySamples = [];
-    let latencyMs = 0;
+    let canvasW = 0;
+    let canvasH = 0;
+    let canvasDpr = 0;
+    let lastResizeCols = 0;
+    let lastResizeRows = 0;
 
     function scheduleDisconnect() {
       clearTimeout(timeoutHandle);
       timeoutHandle = setTimeout(() => { disc.style.display = 'flex'; }, 3000);
     }
 
-    function escapeHtml(ch) {
-      if (ch === '&') return '&amp;';
-      if (ch === '<') return '&lt;';
-      if (ch === '>') return '&gt;';
-      return ch;
+    function renderStats(frameId, speed, sentMs) {
+      if (showStats) {
+        const now = performance.now();
+        if (frameId > lastFrameId && now - fpsLastAt >= 400) {
+          fps = (frameId - fpsLastFrame) / ((now - fpsLastAt) / 1000.0);
+          fpsLastFrame = frameId;
+          fpsLastAt = now;
+        }
+        const nowWall = Date.now();
+        const oneWay = Math.max(0, nowWall - sentMs);
+        latencySamples.push({ t: nowWall, v: oneWay });
+        while (latencySamples.length && (nowWall - latencySamples[0].t) > 250) latencySamples.shift();
+        let latencyMs = 0;
+        if (latencySamples.length) {
+          const total = latencySamples.reduce((acc, s) => acc + s.v, 0);
+          latencyMs = total / latencySamples.length;
+        }
+        stats.style.display = 'block';
+        stats.textContent = `frames:${frameId}  fps:${fps.toFixed(1)}  latency:${latencyMs.toFixed(1)}ms  speed:${speed}`;
+      } else {
+        stats.style.display = 'none';
+      }
     }
 
     function classFromLum(lum) {
@@ -125,127 +150,111 @@ const INDEX_HTML: &str = r#"<!doctype html>
       return 5;
     }
 
-    function readU64(dv, p) {
-      let out = 0n;
-      for (let i = 0; i < 8; i++) {
-        out |= BigInt(dv.getUint8(p + i)) << (8n * BigInt(i));
-      }
+    function decodePacked(packedB64) {
+      if (!packedB64) return new Uint8Array(0);
+      const bin = atob(packedB64);
+      const out = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
       return out;
     }
 
-    function render() {
-      let html = '';
-      for (let y = 0; y < signals.h; y++) {
-        for (let x = 0; x < signals.w; x++) {
-          const idx = y * signals.w + x;
-          const ch = signals.buf[idx];
-          if (ch === ' ') {
-            html += ' ';
-            continue;
-          }
-          const lum = signals.lum[idx] || 0;
-          html += `<span class="cell g${classFromLum(lum)}">${escapeHtml(ch)}</span>`;
-        }
-        if (y + 1 < signals.h) html += '\n';
+    function setupCanvas(width, height) {
+      const dpr = window.devicePixelRatio || 1;
+      if (width !== canvasW || height !== canvasH || dpr !== canvasDpr) {
+        matrix.width = Math.max(1, Math.floor(width * CELL_W * dpr));
+        matrix.height = Math.max(1, Math.floor(height * CELL_H * dpr));
+        matrix.style.width = `${Math.max(1, width * CELL_W)}px`;
+        matrix.style.height = `${Math.max(1, height * CELL_H)}px`;
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.textBaseline = 'top';
+        ctx.textAlign = 'left';
+        ctx.font = FONT;
+        canvasW = width;
+        canvasH = height;
+        canvasDpr = dpr;
       }
-      matrix.innerHTML = html;
-      if (showStats) {
-        stats.style.display = 'block';
-        stats.textContent = `frames:${signals.frameId}  fps:${fps.toFixed(1)}  latency:${latencyMs.toFixed(1)}ms  speed:${signals.speed}`;
-      } else {
-        stats.style.display = 'none';
-      }
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, width * CELL_W, height * CELL_H);
     }
 
-    const cw = Math.max(1, Math.floor(window.innerWidth / 8));
-    const ch = Math.max(1, Math.floor(window.innerHeight / 14));
-    const es = new EventSource(`/events/matrix?cols=${cw}&rows=${ch}`);
-    es.onopen = () => { disc.style.display = 'none'; scheduleDisconnect(); };
-    es.onmessage = (msg) => {
-      scheduleDisconnect();
-      const bin = atob(msg.data);
-      const bytes = new Uint8Array(bin.length);
-      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-      const dv = new DataView(bytes.buffer);
-
-      let p = 0;
-      if (bytes.length < 24) return;
-      const frameId = Number(readU64(dv, p)); p += 8;
-      const sentMs = Number(readU64(dv, p)); p += 8;
-      const speed = dv.getUint8(p); p += 1;
-      const width = dv.getUint16(p, true); p += 2;
-      const height = dv.getUint16(p, true); p += 2;
-      const kind = dv.getUint8(p); p += 1;
-      const colCount = dv.getUint16(p, true); p += 2;
-
-      if (frameId <= signals.frameId) return;
-      if (kind === 0 || signals.w !== width || signals.h !== height) {
-        signals.w = width;
-        signals.h = height;
-        signals.buf = new Array(width * height).fill(' ');
-        signals.lum = new Array(width * height).fill(0);
+    function renderCanvas(packedB64, width, height, frameId) {
+      if (!ctx || !packedB64 || !width || !height) {
+        return;
       }
-
-      for (let c = 0; c < colCount; c++) {
-        if (p + 6 > bytes.length) break;
-        const x = dv.getUint16(p, true); p += 2;
-        const yStart = dv.getUint16(p, true); p += 2;
-        const len = dv.getUint16(p, true); p += 2;
-        if (p + (len * 2) > bytes.length) break;
-        if (x >= signals.w || yStart >= signals.h || (yStart + len) > signals.h) {
-          p += len * 2;
-          continue;
-        }
-        for (let i = 0; i < len; i++) {
-          const glyph = dv.getUint8(p); p += 1;
-          const lum = dv.getUint8(p); p += 1;
-          const y = yStart + i;
-          const idx = y * signals.w + x;
-          if (idx >= 0 && idx < signals.buf.length) {
-            signals.buf[idx] = glyphs[glyph] || ' ';
-            signals.lum[idx] = lum;
+      if (frameId <= lastRenderedFrame) return;
+      setupCanvas(width, height);
+      const packed = decodePacked(packedB64);
+      const needed = width * height * 2;
+      if (packed.length < needed) return;
+      const colors = ['rgb(160,255,160)', 'rgb(0,195,0)', 'rgb(0,170,0)', 'rgb(0,145,0)', 'rgb(0,95,0)', 'rgb(0,20,0)'];
+      let lastClass = -1;
+      let p = 0;
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          const glyph = packed[p];
+          const lum = packed[p + 1];
+          p += 2;
+          const ch = GLYPHS[glyph] || ' ';
+          if (ch !== ' ') {
+            const cls = classFromLum(lum);
+            if (cls !== lastClass) {
+              ctx.fillStyle = colors[cls];
+              lastClass = cls;
+            }
+            ctx.fillText(ch, x * CELL_W, y * CELL_H);
           }
         }
       }
+      lastRenderedFrame = frameId;
+    }
 
-      signals.frameId = frameId;
-      signals.speed = speed;
-      const now = performance.now();
-      if (now - fpsLastAt >= 400) {
-        fps = (frameId - fpsLastFrame) / ((now - fpsLastAt) / 1000.0);
-        fpsLastFrame = frameId;
-        fpsLastAt = now;
-      }
-      const nowWall = Date.now();
-      const oneWay = Math.max(0, nowWall - sentMs);
-      latencySamples.push({ t: nowWall, v: oneWay });
-      while (latencySamples.length && (nowWall - latencySamples[0].t) > 250) latencySamples.shift();
-      if (latencySamples.length) {
-        const total = latencySamples.reduce((acc, s) => acc + s.v, 0);
-        latencyMs = total / latencySamples.length;
-      }
-      disc.style.display = 'none';
-      render();
+    window.__matrixDatastar = {
+      onFrame(frameId, speed, sentMs, packedB64, width, height) {
+        frameId = Number(frameId || 0);
+        speed = Number(speed || 16);
+        sentMs = Number(sentMs || 0);
+        width = Number(width || 0);
+        height = Number(height || 0);
+        renderCanvas(packedB64 || '', width, height, frameId);
+        scheduleDisconnect();
+        disc.style.display = 'none';
+        renderStats(frameId, speed, sentMs);
+        lastFrameId = frameId;
+        lastSpeed = speed;
+        lastSentMs = sentMs;
+      },
+      onKey(evt) {
+        const sendControl = (op) => {
+          fetch(`/cmd/${op}`, { method: 'POST' }).catch(() => {});
+        };
+        if (evt.key === '?') {
+          showStats = !showStats;
+          renderStats(lastFrameId, lastSpeed, lastSentMs);
+        } else if (evt.key === ' ') {
+          evt.preventDefault();
+          sendControl('toggle_pause');
+        } else if (evt.key === '+' || evt.key === '=') {
+          sendControl('speed_up');
+        } else if (evt.key === '-' || evt.key === '_') {
+          sendControl('speed_down');
+        } else if (evt.key === '0') {
+          sendControl('reset_speed');
+        }
+      },
+      onResize(cols, rows) {
+        cols = Number(cols || 1);
+        rows = Number(rows || 1);
+        if (cols === lastResizeCols && rows === lastResizeRows) return;
+        lastResizeCols = cols;
+        lastResizeRows = rows;
+        fetch('/cmd/resize', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ cols, rows }),
+        }).catch(() => {});
+      },
     };
-    es.onerror = () => { disc.style.display = 'flex'; };
-    window.addEventListener('keydown', (ev) => {
-      const sendControl = (op) => {
-        fetch(`/control?op=${op}`, { method: 'POST' }).catch(() => {});
-      };
-      if (ev.key === '?') {
-        showStats = !showStats;
-        render();
-      } else if (ev.key === ' ') {
-        ev.preventDefault();
-        sendControl('toggle_pause');
-      } else if (ev.key === '+' || ev.key === '=') {
-        sendControl('speed_up');
-      } else if (ev.key === '-' || ev.key === '_') {
-        sendControl('speed_down');
-      } else if (ev.key === '0') {
-        sendControl('reset_speed');
-      }
-    });
+    scheduleDisconnect();
   </script>
 </body>
 </html>"#;
@@ -265,6 +274,14 @@ pub struct WebTask {
 
 fn bind_port(requested_port: Option<u16>) -> u16 {
     requested_port.unwrap_or(0)
+}
+
+fn bind_host(public_server: bool) -> Ipv4Addr {
+    if public_server {
+        Ipv4Addr::UNSPECIFIED
+    } else {
+        Ipv4Addr::LOCALHOST
+    }
 }
 
 fn first_frame_for_client(snapshot: &FrameEvent, trigger: &FrameEvent) -> FrameEvent {
@@ -326,9 +343,71 @@ fn encode_frame(frame: &FrameEvent) -> String {
     STANDARD.encode(out)
 }
 
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn apply_cell_buffers(frame: &FrameEvent, glyph_buffer: &mut Vec<u8>, lum_buffer: &mut Vec<u8>) {
+    let needed = frame.width as usize * frame.height as usize;
+    if glyph_buffer.len() != needed {
+        *glyph_buffer = vec![0; needed];
+    }
+    if lum_buffer.len() != needed {
+        *lum_buffer = vec![0; needed];
+    }
+    if frame.kind == FrameKind::Keyframe {
+        glyph_buffer.fill(0);
+        lum_buffer.fill(0);
+    }
+    for cell in &frame.cells {
+        if cell.x < frame.width && cell.y < frame.height {
+            let idx = cell.y as usize * frame.width as usize + cell.x as usize;
+            if idx < glyph_buffer.len() {
+                glyph_buffer[idx] = cell.glyph;
+                lum_buffer[idx] = cell.lum;
+            }
+        }
+    }
+}
+
+fn datastar_signal_event(
+    frame: &FrameEvent,
+    glyph_buffer: &mut Vec<u8>,
+    lum_buffer: &mut Vec<u8>,
+    packed_buffer: &mut Vec<u8>,
+) -> Event {
+    apply_cell_buffers(frame, glyph_buffer, lum_buffer);
+    let cells = glyph_buffer.len();
+    let needed = cells * 2;
+    if packed_buffer.len() != needed {
+        *packed_buffer = vec![0; needed];
+    }
+    for i in 0..cells {
+        let p = i * 2;
+        packed_buffer[p] = glyph_buffer[i];
+        packed_buffer[p + 1] = lum_buffer[i];
+    }
+    let packed_b64 = STANDARD.encode(&*packed_buffer);
+    let signals = json!({
+        "frameId": frame.frame_id,
+        "speed": frame.speed_step,
+        "sentMs": unix_ms(),
+        "connected": true,
+        "packedB64": packed_b64,
+        "width": frame.width,
+        "height": frame.height,
+    })
+    .to_string();
+    PatchSignals::new(signals).write_as_axum_sse_event()
+}
+
 pub fn spawn_server(
     token: CancellationToken,
     requested_port: Option<u16>,
+    public_server: bool,
     tx: broadcast::Sender<FrameEvent>,
     latest: Arc<RwLock<FrameEvent>>,
     resize_tx: mpsc::UnboundedSender<(u16, u16)>,
@@ -337,7 +416,7 @@ pub fn spawn_server(
 ) -> anyhow::Result<WebTask> {
     let shutdown = token.child_token();
 
-    let bind_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, bind_port(requested_port)));
+    let bind_addr = SocketAddr::from((bind_host(public_server), bind_port(requested_port)));
     let std_listener = std::net::TcpListener::bind(bind_addr).context("web bind failed")?;
     std_listener
         .set_nonblocking(true)
@@ -362,8 +441,10 @@ pub fn spawn_server(
     let app = Router::new()
         .route("/", get(index))
         .route("/events/matrix", get(events))
-        .route("/control", post(control))
-        .with_state(app_state);
+        .route("/events", get(events_datastar).patch(events_datastar_patch))
+        .route("/cmd/{op}", post(cmd))
+        .with_state(app_state)
+        .layer(CompressionLayer::new());
 
     let handle = tokio::spawn(async move {
         axum::serve(listener, app)
@@ -435,11 +516,96 @@ async fn events(
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(10)))
 }
 
-async fn control(
+async fn events_datastar(
     State(state): State<AppState>,
-    Query(control): Query<ControlQuery>,
+    Query(viewport): Query<ViewportQuery>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    events_datastar_inner(state, viewport.cols, viewport.rows)
+}
+
+async fn events_datastar_patch(
+    State(state): State<AppState>,
+    Json(viewport): Json<ViewportBody>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    events_datastar_inner(state, viewport.cols, viewport.rows)
+}
+
+fn events_datastar_inner(
+    state: AppState,
+    cols: Option<u16>,
+    rows: Option<u16>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    if let (Some(cols), Some(rows)) = (cols, rows) {
+        let _ = state.shared.resize_tx.send((cols.max(1), rows.max(1)));
+    }
+    state.telemetry.inc_clients();
+    let mut rx = state.shared.tx.subscribe();
+    let latest = state.shared.latest.clone();
+    let telemetry = state.telemetry.clone();
+    let shutdown = state.shutdown.clone();
+
+    let stream = stream! {
+        struct ClientGuard(Arc<Telemetry>);
+        impl Drop for ClientGuard {
+            fn drop(&mut self) {
+                self.0.dec_clients();
+            }
+        }
+
+        let _guard = ClientGuard(telemetry.clone());
+        let mut first = true;
+        let mut last_frame = 0u64;
+        let mut glyph_buffer: Vec<u8> = Vec::new();
+        let mut lum_buffer: Vec<u8> = Vec::new();
+        let mut packed_buffer: Vec<u8> = Vec::new();
+
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                recv = rx.recv() => {
+                    match recv {
+                        Ok(frame) => {
+                            if frame.stale_for(last_frame) {
+                                continue;
+                            }
+                            if first {
+                                first = false;
+                                let snapshot = latest.read().await.clone();
+                                let first_frame = first_frame_for_client(&snapshot, &frame);
+                                yield Ok(datastar_signal_event(
+                                    &first_frame,
+                                    &mut glyph_buffer,
+                                    &mut lum_buffer,
+                                    &mut packed_buffer,
+                                ));
+                            }
+                            yield Ok(datastar_signal_event(
+                                &frame,
+                                &mut glyph_buffer,
+                                &mut lum_buffer,
+                                &mut packed_buffer,
+                            ));
+                            last_frame = frame.frame_id;
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            telemetry.add_drops(n as u64);
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
+        }
+    };
+
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(10)))
+}
+
+async fn cmd(
+    State(state): State<AppState>,
+    Path(op): Path<String>,
+    body: Option<Json<ViewportBody>>,
 ) -> StatusCode {
-    match control.op.as_str() {
+    match op.as_str() {
         "toggle_pause" => {
             let _ = state.shared.control_tx.send(ControlMessage::TogglePause);
         }
@@ -451,6 +617,13 @@ async fn control(
         }
         "reset_speed" => {
             let _ = state.shared.control_tx.send(ControlMessage::ResetSpeed);
+        }
+        "resize" => {
+            if let Some(Json(vp)) = body {
+                if let (Some(cols), Some(rows)) = (vp.cols, vp.rows) {
+                    let _ = state.shared.resize_tx.send((cols.max(1), rows.max(1)));
+                }
+            }
         }
         _ => {}
     }
@@ -464,8 +637,9 @@ struct ViewportQuery {
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct ControlQuery {
-    op: String,
+struct ViewportBody {
+    cols: Option<u16>,
+    rows: Option<u16>,
 }
 
 #[cfg(test)]
@@ -476,6 +650,12 @@ mod tests {
     fn random_port_uses_zero_bind() {
         assert_eq!(bind_port(None), 0);
         assert_eq!(bind_port(Some(1234)), 1234);
+    }
+
+    #[test]
+    fn bind_host_defaults_localhost_and_server_is_unspecified() {
+        assert_eq!(bind_host(false), Ipv4Addr::LOCALHOST);
+        assert_eq!(bind_host(true), Ipv4Addr::UNSPECIFIED);
     }
 
     #[test]
@@ -504,8 +684,9 @@ mod tests {
     #[test]
     fn browser_markup_contains_disconnect_and_binary_parser_checks() {
         assert!(INDEX_HTML.contains("[ Disconnected ]"));
-        assert!(INDEX_HTML.contains("frameId <= signals.frameId"));
-        assert!(INDEX_HTML.contains("const colCount = dv.getUint16"));
+        assert!(INDEX_HTML.contains("data-effect=\"window.__matrixDatastar.onFrame($frameId, $speed, $sentMs, $packedB64, $width, $height)\""));
+        assert!(INDEX_HTML.contains("data-init=\"@patch('/events'"));
+        assert!(INDEX_HTML.contains("datastar.js"));
     }
 
     #[test]

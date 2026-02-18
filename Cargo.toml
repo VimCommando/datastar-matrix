@@ -5,7 +5,7 @@ edition = "2024"
 
 [features]
 default = ["web"]
-web = ["dep:axum", "dep:async-stream"]
+web = ["dep:axum", "dep:async-stream", "dep:tower-http", "dep:datastar"]
 
 [dependencies]
 anyhow = "1.0"
@@ -21,3 +21,5 @@ serde_json = "1.0"
 tokio = { version = "1.44", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "net"] }
 tokio-stream = "0.1"
 tokio-util = "0.7"
+tower-http = { version = "0.6", features = ["compression-br"], optional = true }
+datastar = { version = "0.3.1", features = ["axum"], optional = true }

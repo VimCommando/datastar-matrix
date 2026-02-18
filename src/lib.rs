@@ -67,6 +67,7 @@ pub async fn run() -> anyhow::Result<()> {
         Some(web::spawn_server(
             token.clone(),
             cfg.port,
+            cfg.server,
             shared.tx.clone(),
             shared.latest.clone(),
             shared.resize_tx.clone(),

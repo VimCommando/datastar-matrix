@@ -40,8 +40,8 @@ The terminal renderer SHALL toggle a telemetry overlay when the user presses `?`
 - **THEN** the telemetry overlay visibility toggles between hidden and visible
 
 ### Requirement: Bottom-right telemetry counters
-When visible, the telemetry overlay MUST be anchored in the bottom-right of the terminal view and display `clients`, `frames`, and `drops` counters.
+When visible, the telemetry overlay MUST be anchored in the bottom-right of the terminal view and display `clients`, `frames`, `fps`, and `speed` counters.
 
 #### Scenario: Telemetry overlay is enabled
 - **WHEN** the overlay is visible during runtime
-- **THEN** the terminal shows `clients`, `frames`, and `drops` values in a bottom-right overlay
+- **THEN** the terminal shows `clients`, `frames`, `fps`, and `speed` values in a bottom-right overlay

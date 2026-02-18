@@ -10,6 +10,8 @@ pub struct Config {
     pub target_fps: f32,
     #[arg(long = "port")]
     pub port: Option<u16>,
+    #[arg(long = "server", default_value_t = false)]
+    pub server: bool,
 }
 
 impl Config {
@@ -38,13 +40,22 @@ mod tests {
         let cfg = Config::try_parse_from(["datastar-matrix"]).expect("default parse should work");
         assert_eq!(cfg.target_fps, 60.0);
         assert_eq!(cfg.port, None);
+        assert!(!cfg.server);
     }
 
     #[test]
-    fn parses_fps_and_port() {
-        let cfg = Config::try_parse_from(["datastar-matrix", "--fps", "30", "--port", "8123"])
+    fn parses_fps_port_and_server() {
+        let cfg = Config::try_parse_from([
+            "datastar-matrix",
+            "--fps",
+            "30",
+            "--port",
+            "8123",
+            "--server",
+        ])
             .expect("parse should work");
         assert_eq!(cfg.target_fps, 30.0);
         assert_eq!(cfg.port, Some(8123));
+        assert!(cfg.server);
     }
 }
