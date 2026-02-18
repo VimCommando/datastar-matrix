@@ -81,7 +81,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       data-init="@patch('/events', {cols: $cols, rows: $rows})"
       data-effect="window.__matrixDatastar.onFrame($frameId, $speed, $sentMs, $packedB64, $width, $height)"
       data-on:keydown__window="window.__matrixDatastar.onKey(evt)"
-      data-on:resize__window__debounce.1s="$cols = Math.max(1, Math.ceil(window.innerWidth / 10)); $rows = Math.max(1, Math.ceil(window.innerHeight / 20)); $width = $cols; $height = $rows; window.__matrixDatastar.onResize($cols, $rows)"
+      data-on:resize__window__debounce.500ms="$cols = Math.max(1, Math.ceil(window.innerWidth / 10)); $rows = Math.max(1, Math.ceil(window.innerHeight / 20)); $width = $cols; $height = $rows; window.__matrixDatastar.onResize($cols, $rows)"
     ></div>
   </div>
   <script>
@@ -295,54 +295,6 @@ fn first_frame_for_client(snapshot: &FrameEvent, trigger: &FrameEvent) -> FrameE
     }
 }
 
-fn encode_frame(frame: &FrameEvent) -> String {
-    let mut cells = frame.cells.clone();
-    cells.sort_by_key(|c| (c.x, c.y));
-
-    let mut columns: Vec<(u16, u16, Vec<(u8, u8)>)> = Vec::new();
-    let mut i = 0usize;
-    while i < cells.len() {
-        let x = cells[i].x;
-        let start_y = cells[i].y;
-        let mut cur_y = start_y;
-        let mut payload = vec![(cells[i].glyph, cells[i].lum)];
-        i += 1;
-        while i < cells.len() && cells[i].x == x && cells[i].y == cur_y + 1 {
-            cur_y = cells[i].y;
-            payload.push((cells[i].glyph, cells[i].lum));
-            i += 1;
-        }
-        columns.push((x, start_y, payload));
-    }
-
-    let mut out = Vec::with_capacity(25 + columns.len() * 6 + cells.len() * 2);
-    let sent_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    out.extend_from_slice(&frame.frame_id.to_le_bytes());
-    out.extend_from_slice(&sent_ms.to_le_bytes());
-    out.push(frame.speed_step);
-    out.extend_from_slice(&frame.width.to_le_bytes());
-    out.extend_from_slice(&frame.height.to_le_bytes());
-    out.push(match frame.kind {
-        FrameKind::Keyframe => 0,
-        FrameKind::Delta => 1,
-    });
-    out.extend_from_slice(&(columns.len() as u16).to_le_bytes());
-    for (x, y_start, payload) in columns {
-        out.extend_from_slice(&x.to_le_bytes());
-        out.extend_from_slice(&y_start.to_le_bytes());
-        out.extend_from_slice(&(payload.len() as u16).to_le_bytes());
-        for (glyph, lum) in payload {
-            out.push(glyph);
-            out.push(lum);
-        }
-    }
-
-    STANDARD.encode(out)
-}
-
 fn unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -440,7 +392,6 @@ pub fn spawn_server(
 
     let app = Router::new()
         .route("/", get(index))
-        .route("/events/matrix", get(events))
         .route("/events", get(events_datastar).patch(events_datastar_patch))
         .route("/cmd/{op}", post(cmd))
         .with_state(app_state)
@@ -463,57 +414,6 @@ pub fn spawn_server(
 
 async fn index() -> impl IntoResponse {
     Html(INDEX_HTML)
-}
-
-async fn events(
-    State(state): State<AppState>,
-    Query(viewport): Query<ViewportQuery>,
-) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
-    if let (Some(cols), Some(rows)) = (viewport.cols, viewport.rows) {
-        let _ = state.shared.resize_tx.send((cols.max(1), rows.max(1)));
-    }
-    state.telemetry.inc_clients();
-    let mut rx = state.shared.tx.subscribe();
-    let latest = state.shared.latest.clone();
-    let telemetry = state.telemetry.clone();
-    let shutdown = state.shutdown.clone();
-
-    let stream = stream! {
-        struct ClientGuard(Arc<Telemetry>);
-        impl Drop for ClientGuard {
-            fn drop(&mut self) {
-                self.0.dec_clients();
-            }
-        }
-
-        let _guard = ClientGuard(telemetry.clone());
-        let mut first = true;
-
-        loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => break,
-                recv = rx.recv() => {
-                    match recv {
-                        Ok(frame) => {
-                            if first {
-                                first = false;
-                                let snapshot = latest.read().await.clone();
-                                let first_frame = first_frame_for_client(&snapshot, &frame);
-                                yield Ok(Event::default().data(encode_frame(&first_frame)));
-                            }
-                            yield Ok(Event::default().data(encode_frame(&frame)));
-                        }
-                        Err(broadcast::error::RecvError::Lagged(n)) => {
-                            telemetry.add_drops(n as u64);
-                        }
-                        Err(broadcast::error::RecvError::Closed) => break,
-                    }
-                }
-            }
-        }
-    };
-
-    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(10)))
 }
 
 async fn events_datastar(
@@ -690,21 +590,8 @@ mod tests {
     }
 
     #[test]
-    fn encodes_binary_frame_with_header_and_columns() {
-        let frame = FrameEvent {
-            frame_id: 7,
-            speed_step: 16,
-            width: 3,
-            height: 3,
-            kind: FrameKind::Delta,
-            cells: vec![
-                crate::frame::CellUpdate { x: 1, y: 1, glyph: 2, lum: 200 },
-                crate::frame::CellUpdate { x: 1, y: 2, glyph: 3, lum: 120 },
-            ],
-        };
-        let encoded = encode_frame(&frame);
-        let bytes = STANDARD.decode(encoded).expect("valid base64");
-        assert_eq!(u64::from_le_bytes(bytes[0..8].try_into().expect("u64 bytes")), 7);
-        assert_eq!(u16::from_le_bytes(bytes[22..24].try_into().expect("cols bytes")), 1);
+    fn browser_markup_contains_stale_and_disconnect_logic() {
+        assert!(INDEX_HTML.contains("if (frameId <= lastRenderedFrame) return;"));
+        assert!(INDEX_HTML.contains("setTimeout(() => { disc.style.display = 'flex'; }, 3000)"));
     }
 }

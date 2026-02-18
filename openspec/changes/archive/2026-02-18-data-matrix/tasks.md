@@ -2,7 +2,7 @@
 
 - [x] 1.1 Create crate/module structure for simulation, terminal rendering, web streaming, telemetry, and shared frame types
 - [x] 1.2 Add Cargo feature flag for web server support and gate Axum/SSE modules behind it
-- [x] 1.3 Implement CLI parsing for `--fps` and `--port` only
+- [x] 1.3 Implement CLI parsing for `--fps`, `--port`, and `--server`
 - [x] 1.4 Implement random available port selection when `--port` is omitted and web feature is enabled
 
 ## 2. Shared Simulation Engine
@@ -27,12 +27,12 @@
 - [x] 4.2 Implement terminal bounds-safe drawing with no out-of-bounds writes
 - [x] 4.3 Implement terminal resize behavior: top-left anchored continuity, clip on shrink, fill new space on growth
 - [x] 4.4 Implement `?` keybinding to toggle telemetry overlay visibility
-- [x] 4.5 Implement bottom-right telemetry overlay showing `clients`, `frames`, and `drops`
+- [x] 4.5 Implement bottom-right telemetry overlay showing `clients`, `frames`, `fps`, and `speed`
 
 ## 5. Axum SSE Server
 
 - [x] 5.1 Implement web server bootstrap on configured or random port when web feature is enabled
-- [x] 5.2 Implement `/events/matrix` SSE endpoint with unauthenticated HTTP access
+- [x] 5.2 Implement `/events` SSE endpoint with unauthenticated HTTP access
 - [x] 5.3 Implement late-join behavior: send full keyframe on next tick, then sparse deltas
 - [x] 5.4 Implement multi-client streaming with bounded buffering and slow-client stale-frame dropping
 - [x] 5.5 Implement stream telemetry counter updates for active clients, emitted frames, and dropped frames

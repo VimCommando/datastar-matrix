@@ -41,7 +41,7 @@ The change introduces a single Rust application with two live outputs: a local t
   - Sending full text buffers each tick. Rejected as too heavy for SSE clients at high cell counts.
 
 4. Axum SSE endpoint for live stream
-- Decision: Provide `/events/matrix` endpoint using `text/event-stream`, emitting one event per simulation tick plus a periodic keepalive. New subscribers receive a full keyframe on the next tick, then continue with sparse delta updates.
+- Decision: Provide `/events` endpoint using `text/event-stream`, emitting one event per simulation tick plus a periodic keepalive. New subscribers receive a full keyframe on the next tick, then continue with sparse delta updates.
 - Rationale: SSE is simple for one-way server push and aligns with Datastar signal updates.
 - Alternatives considered:
   - WebSockets. Rejected for unnecessary bidirectional complexity in initial scope.
@@ -75,7 +75,7 @@ The change introduces a single Rust application with two live outputs: a local t
   - Full state reset on every resize. Rejected because it is disruptive and discards ongoing animation state.
 
 9. Minimal CLI surface with compile-time web toggle
-- Decision: Expose only `--fps` and `--port` as runtime flags. If `--port` is omitted, bind web server to a random available port. Web server support is compiled in/out via a Cargo feature flag.
+- Decision: Expose `--fps`, `--port`, and `--server` as runtime flags. If `--port` is omitted, bind web server to a random available port. `--server` switches binding from localhost to `0.0.0.0`. Web server support is compiled in/out via a Cargo feature flag.
 - Rationale: Keeps user-facing controls simple while enabling no-web builds and avoiding fixed-port collisions by default.
 - Alternatives considered:
   - Mandatory fixed port input. Rejected due to poor usability and port conflict risk.
@@ -89,7 +89,7 @@ The change introduces a single Rust application with two live outputs: a local t
   - Silent stale-frame display in browser on disconnect. Rejected because it hides failure and implies live updates.
 
 11. Toggleable terminal telemetry overlay
-- Decision: Add a `?` keybinding that toggles a bottom-right telemetry overlay showing `clients`, `frames`, and `drops`.
+- Decision: Add a `?` keybinding that toggles a bottom-right telemetry overlay showing `clients`, `frames`, `fps`, and `speed`.
 - Rationale: Provides lightweight runtime visibility without permanently obscuring matrix visuals.
 - Alternatives considered:
   - Always-on counters. Rejected because constant overlay reduces visual immersion.

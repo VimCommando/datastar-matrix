@@ -10,7 +10,7 @@ There is no single executable that renders a Matrix-style animation locally in t
 - Add a Datastar-compatible frontend contract driven by server signals so the browser reproduces the same Matrix output as the terminal view.
 - Define synchronization behavior so terminal and web consumers are fed from the same simulation timeline.
 - Add a configurable target framerate for simulation/render updates with a default of 60 FPS.
-- Expose CLI options `--fps` and `--port`, defaulting port to a random available value when omitted, and gate web server availability behind a compile-time feature flag.
+- Expose CLI options `--fps`, `--port`, and `--server`, defaulting port to a random available value when omitted, and gate web server availability behind a compile-time feature flag.
 
 ## Capabilities
 

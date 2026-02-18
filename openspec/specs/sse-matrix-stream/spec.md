@@ -1,7 +1,11 @@
-## ADDED Requirements
+## Purpose
+
+Define server-side streaming behavior for matrix updates, including endpoint contract, synchronization behavior, concurrency handling, and telemetry expectations.
+
+## Requirements
 
 ### Requirement: SSE endpoint for matrix updates
-The server SHALL expose an HTTP Server-Sent Events endpoint that publishes matrix frame updates for connected clients.
+The server SHALL expose an HTTP Server-Sent Events endpoint at `/events` that publishes matrix frame updates for connected clients.
 
 #### Scenario: Client connects to matrix stream endpoint
 - **WHEN** a client performs a GET request to the configured matrix events endpoint
