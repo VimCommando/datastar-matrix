@@ -65,19 +65,28 @@ pub async fn run() -> anyhow::Result<()> {
 
     #[cfg(feature = "web")]
     let web_task = if cfg.web_enabled() {
+        let web_transport = cfg.web_transport()?;
         Some(web::spawn_server(
             token.clone(),
             cfg.port,
             cfg.server,
+            web_transport,
             shared.tx.clone(),
             shared.latest.clone(),
             shared.resize_tx.clone(),
             shared.control_tx.clone(),
             telemetry.clone(),
-        )?)
+        )
+        .await?)
     } else {
         None
     };
+
+    #[cfg(feature = "web")]
+    if let Some(task) = &web_task {
+        let host = if cfg.server { "0.0.0.0" } else { "127.0.0.1" };
+        eprintln!("web: {}://{}:{}", task.scheme, host, task.port);
+    }
 
     #[cfg(not(feature = "web"))]
     let _ = cfg;

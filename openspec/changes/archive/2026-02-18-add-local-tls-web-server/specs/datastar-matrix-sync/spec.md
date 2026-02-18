@@ -10,16 +10,3 @@ The web client integration SHALL map incoming stream updates into Datastar signa
 #### Scenario: Browser is connected to secure origin
 - **WHEN** the web UI is loaded over HTTPS in the default secure mode and receives `/events` updates from the same secure origin
 - **THEN** the renderer applies frame updates without changing parity behavior relative to the terminal output
-
-## ADDED Requirements
-
-### Requirement: Pointer click mapping to glitch command
-The browser integration MUST convert pointer click position into integer matrix cell coordinates and SHALL issue `POST /cmd/glitch` with payload `{"x": int, "y": int}` for ripple initiation.
-
-#### Scenario: User clicks on visible matrix canvas cell
-- **WHEN** the user clicks within the visible matrix viewport
-- **THEN** the browser sends a glitch command with mapped cell coordinates to the backend
-
-#### Scenario: Click lands outside active matrix bounds after resize
-- **WHEN** coordinate mapping yields values outside current matrix bounds
-- **THEN** the client clamps or normalizes coordinates before sending the glitch command

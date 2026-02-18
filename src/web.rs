@@ -1,10 +1,12 @@
 use std::convert::Infallible;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::Context;
 use async_stream::stream;
+use axum_server::tls_rustls::RustlsConfig;
 use axum::extract::{Path, Query, State};
 use axum::Json;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -15,13 +17,16 @@ use axum::Router;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use datastar::prelude::PatchSignals;
+use rcgen::generate_simple_self_signed;
 use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tower_http::compression::predicate::{NotForContentType, Predicate, SizeAbove};
 use tower_http::compression::CompressionLayer;
 
+use crate::config::WebTransport;
 use crate::SharedStreamState;
 use crate::frame::{FrameEvent, FrameKind};
 use crate::telemetry::Telemetry;
@@ -286,6 +291,7 @@ pub struct WebTask {
     pub handle: JoinHandle<anyhow::Result<()>>,
     pub shutdown: CancellationToken,
     pub port: u16,
+    pub scheme: &'static str,
 }
 
 fn bind_port(requested_port: Option<u16>) -> u16 {
@@ -381,10 +387,29 @@ fn clamp_glitch_to_frame(glitch: GlitchBody, frame: &FrameEvent) -> (u16, u16) {
     )
 }
 
-pub fn spawn_server(
+fn ensure_rustls_provider() {
+    static INIT: OnceLock<()> = OnceLock::new();
+    INIT.get_or_init(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
+fn generate_dev_tls_pem() -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    let names = vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+        "ironhide.local".to_string(),
+    ];
+    let cert = generate_simple_self_signed(names).context("failed to generate dev tls cert")?;
+    Ok((cert.cert.pem().into_bytes(), cert.key_pair.serialize_pem().into_bytes()))
+}
+
+pub async fn spawn_server(
     token: CancellationToken,
     requested_port: Option<u16>,
     public_server: bool,
+    transport: WebTransport,
     tx: broadcast::Sender<FrameEvent>,
     latest: Arc<RwLock<FrameEvent>>,
     resize_tx: mpsc::UnboundedSender<(u16, u16)>,
@@ -402,8 +427,6 @@ pub fn spawn_server(
         .local_addr()
         .context("could not inspect local address")?
         .port();
-    let listener = TcpListener::from_std(std_listener).context("failed to create tokio listener")?;
-
     let app_state = AppState {
         shared: Arc::new(SharedStreamState {
             tx,
@@ -414,19 +437,72 @@ pub fn spawn_server(
         telemetry,
         shutdown: shutdown.clone(),
     };
+    let compression_predicate = SizeAbove::default()
+        .and(NotForContentType::GRPC)
+        .and(NotForContentType::IMAGES);
 
     let app = Router::new()
         .route("/", get(index))
         .route("/events", get(events_datastar).patch(events_datastar_patch))
         .route("/cmd/{op}", post(cmd))
         .with_state(app_state)
-        .layer(CompressionLayer::new());
+        .layer(CompressionLayer::new().compress_when(compression_predicate));
+
+    let tls_config = match &transport {
+        WebTransport::Http => None,
+        WebTransport::HttpsProvided { cert_path, key_path } => {
+            ensure_rustls_provider();
+            Some(
+                RustlsConfig::from_pem_file(cert_path.clone(), key_path.clone())
+                    .await
+                    .context("failed to load tls cert/key")?,
+            )
+        }
+        WebTransport::HttpsAuto => {
+            ensure_rustls_provider();
+            let (cert_pem, key_pem) = generate_dev_tls_pem()?;
+            Some(
+                RustlsConfig::from_pem(cert_pem, key_pem)
+                    .await
+                    .context("failed to load generated dev tls cert/key")?,
+            )
+        }
+    };
+
+    let scheme = match &transport {
+        WebTransport::Http => "http",
+        WebTransport::HttpsProvided { .. } | WebTransport::HttpsAuto => "https",
+    };
 
     let handle = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown.cancelled_owned())
-            .await
-            .context("web serve failed")?;
+        match transport {
+            WebTransport::Http => {
+                let listener =
+                    TcpListener::from_std(std_listener).context("failed to create tokio listener")?;
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(shutdown.cancelled_owned())
+                    .await
+                    .context("web serve failed")?;
+            }
+            WebTransport::HttpsProvided { .. } | WebTransport::HttpsAuto => {
+                let server_handle = axum_server::Handle::new();
+                let shutdown_handle = server_handle.clone();
+                let shutdown_task = tokio::spawn(async move {
+                    shutdown.cancelled().await;
+                    shutdown_handle.graceful_shutdown(Some(Duration::from_secs(2)));
+                });
+
+                axum_server::from_tcp_rustls(
+                    std_listener,
+                    tls_config.expect("tls config must be present in https mode"),
+                )
+                .handle(server_handle)
+                .serve(app.into_make_service())
+                .await
+                .context("web tls serve failed")?;
+                shutdown_task.abort();
+            }
+        }
         Ok(())
     });
 
@@ -434,6 +510,7 @@ pub fn spawn_server(
         handle,
         shutdown: token,
         port,
+        scheme,
     })
 }
 
@@ -594,6 +671,32 @@ struct GlitchBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    fn test_frame() -> FrameEvent {
+        FrameEvent {
+            frame_id: 0,
+            speed_step: 16,
+            width: 4,
+            height: 4,
+            kind: FrameKind::Keyframe,
+            cells: vec![],
+        }
+    }
+
+    fn test_shared_state(
+    ) -> (
+        broadcast::Sender<FrameEvent>,
+        Arc<RwLock<FrameEvent>>,
+        mpsc::UnboundedSender<(u16, u16)>,
+        mpsc::UnboundedSender<ControlMessage>,
+    ) {
+        let (tx, _rx) = broadcast::channel(8);
+        let latest = Arc::new(RwLock::new(test_frame()));
+        let (resize_tx, _resize_rx) = mpsc::unbounded_channel();
+        let (control_tx, _control_rx) = mpsc::unbounded_channel();
+        (tx, latest, resize_tx, control_tx)
+    }
 
     #[test]
     fn random_port_uses_zero_bind() {
@@ -656,5 +759,140 @@ mod tests {
         };
         let (x, y) = clamp_glitch_to_frame(GlitchBody { x: -5, y: 500 }, &frame);
         assert_eq!((x, y), (0, 4));
+    }
+
+    #[tokio::test]
+    async fn tls_mode_fails_fast_for_invalid_cert_paths() {
+        let token = CancellationToken::new();
+        let telemetry = Arc::new(Telemetry::default());
+        let (tx, latest, resize_tx, control_tx) = test_shared_state();
+
+        let result = spawn_server(
+            token,
+            Some(0),
+            false,
+            WebTransport::HttpsProvided {
+                cert_path: PathBuf::from("/definitely/missing/cert.pem"),
+                key_path: PathBuf::from("/definitely/missing/key.pem"),
+            },
+            tx,
+            latest,
+            resize_tx,
+            control_tx,
+            telemetry,
+        )
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn http_mode_serves_root_and_events() {
+        let token = CancellationToken::new();
+        let telemetry = Arc::new(Telemetry::default());
+        let (tx, latest, resize_tx, control_tx) = test_shared_state();
+        let task = spawn_server(
+            token.clone(),
+            Some(0),
+            false,
+            WebTransport::Http,
+            tx,
+            latest,
+            resize_tx,
+            control_tx,
+            telemetry,
+        )
+        .await
+        .expect("http spawn should work");
+        assert_eq!(task.scheme, "http");
+
+        let client = reqwest::Client::builder()
+            .build()
+            .expect("client should build");
+        let root = client
+            .get(format!("http://127.0.0.1:{}/", task.port))
+            .send()
+            .await
+            .expect("http root should respond");
+        assert!(root.status().is_success());
+
+        let events = client
+            .get(format!(
+                "http://127.0.0.1:{}/events?cols=4&rows=4",
+                task.port
+            ))
+            .send()
+            .await
+            .expect("http events should respond");
+        assert!(events.status().is_success());
+        let content_type = events
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(content_type.starts_with("text/event-stream"));
+        drop(events);
+
+        task.shutdown.cancel();
+        let _ = task.handle.await.expect("task join should succeed");
+    }
+
+    #[tokio::test]
+    async fn https_mode_serves_root_and_events_with_brotli() {
+        let token = CancellationToken::new();
+        let telemetry = Arc::new(Telemetry::default());
+        let (tx, latest, resize_tx, control_tx) = test_shared_state();
+        let task = spawn_server(
+            token.clone(),
+            Some(0),
+            false,
+            WebTransport::HttpsAuto,
+            tx,
+            latest,
+            resize_tx,
+            control_tx,
+            telemetry,
+        )
+        .await
+        .expect("https spawn should work");
+        assert_eq!(task.scheme, "https");
+
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .expect("client should build");
+        let root = client
+            .get(format!("https://127.0.0.1:{}/", task.port))
+            .send()
+            .await
+            .expect("https root should respond");
+        assert!(root.status().is_success());
+
+        let events = client
+            .get(format!(
+                "https://127.0.0.1:{}/events?cols=4&rows=4",
+                task.port
+            ))
+            .header("accept-encoding", "br, gzip")
+            .send()
+            .await
+            .expect("https events should respond");
+        assert!(events.status().is_success());
+        let content_type = events
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(content_type.starts_with("text/event-stream"));
+        let content_encoding = events
+            .headers()
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(content_encoding, "br");
+        drop(events);
+
+        task.shutdown.cancel();
+        let _ = task.handle.await.expect("task join should succeed");
     }
 }
