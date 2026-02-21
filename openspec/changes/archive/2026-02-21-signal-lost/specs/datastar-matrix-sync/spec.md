@@ -18,16 +18,3 @@ The web client integration SHALL map incoming stream updates into Datastar signa
 #### Scenario: Stream recovers after Signal Lost state
 - **WHEN** a fresh frame is received after Signal Lost rendering was shown
 - **THEN** in-band Signal Lost rendering is cleared and live matrix rendering continues
-
-## ADDED Requirements
-
-### Requirement: Pointer click mapping to glitch command
-The browser integration MUST convert pointer click position into integer matrix cell coordinates and SHALL issue `POST /cmd/glitch` with payload `{"x": int, "y": int}` for ripple initiation.
-
-#### Scenario: User clicks on visible matrix canvas cell
-- **WHEN** the user clicks within the visible matrix viewport
-- **THEN** the browser sends a glitch command with mapped cell coordinates to the backend
-
-#### Scenario: Click lands outside active matrix bounds after resize
-- **WHEN** coordinate mapping yields values outside current matrix bounds
-- **THEN** the client clamps or normalizes coordinates before sending the glitch command

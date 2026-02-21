@@ -66,18 +66,20 @@ pub async fn run() -> anyhow::Result<()> {
     #[cfg(feature = "web")]
     let web_task = if cfg.web_enabled() {
         let web_transport = cfg.web_transport()?;
-        Some(web::spawn_server(
-            token.clone(),
-            cfg.port,
-            cfg.server,
-            web_transport,
-            shared.tx.clone(),
-            shared.latest.clone(),
-            shared.resize_tx.clone(),
-            shared.control_tx.clone(),
-            telemetry.clone(),
+        Some(
+            web::spawn_server(
+                token.clone(),
+                cfg.port,
+                cfg.server,
+                web_transport,
+                shared.tx.clone(),
+                shared.latest.clone(),
+                shared.resize_tx.clone(),
+                shared.control_tx.clone(),
+                telemetry.clone(),
+            )
+            .await?,
         )
-        .await?)
     } else {
         None
     };
@@ -125,6 +127,11 @@ fn spawn_simulation_task(
         let base_fps = simulation.target_fps().max(1.0);
         let mut speed_step: i32 = 16;
         let mut paused = false;
+        let mut web_max_w: u16 = 0;
+        let mut web_max_h: u16 = 0;
+        let (mut terminal_w, mut terminal_h) = terminal::current_terminal_size().unwrap_or((1, 1));
+        terminal_w = terminal_w.max(1);
+        terminal_h = terminal_h.max(1);
         let mut ticker = interval(tick_duration(base_fps, speed_step));
         let mut last_resize_check = Instant::now();
         let mut last_heartbeat_at = Instant::now();
@@ -133,7 +140,11 @@ fn spawn_simulation_task(
             tokio::select! {
                 _ = token.cancelled() => break,
                 Some((w, h)) = resize_rx.recv() => {
-                    simulation.grow_to_fit(w, h);
+                    web_max_w = w;
+                    web_max_h = h;
+                    let target_w = terminal_w.max(web_max_w).max(1);
+                    let target_h = terminal_h.max(web_max_h).max(1);
+                    simulation.resize(target_w, target_h);
                 }
                 Some(control) = control_rx.recv() => {
                     match control {
@@ -167,7 +178,11 @@ fn spawn_simulation_task(
                     }
                     if last_resize_check.elapsed() > Duration::from_millis(100) {
                         if let Some((w, h)) = terminal::current_terminal_size() {
-                            simulation.grow_to_fit(w, h);
+                            terminal_w = w.max(1);
+                            terminal_h = h.max(1);
+                            let target_w = terminal_w.max(web_max_w).max(1);
+                            let target_h = terminal_h.max(web_max_h).max(1);
+                            simulation.resize(target_w, target_h);
                         }
                         last_resize_check = Instant::now();
                     }

@@ -1,19 +1,20 @@
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::Context;
 use async_stream::stream;
-use axum_server::tls_rustls::RustlsConfig;
-use axum::extract::{Path, Query, State};
 use axum::Json;
+use axum::Router;
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse};
-use axum::http::StatusCode;
 use axum::routing::{get, post};
-use axum::Router;
+use axum_server::tls_rustls::RustlsConfig;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use datastar::prelude::PatchSignals;
@@ -23,14 +24,14 @@ use tokio::net::TcpListener;
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tower_http::compression::predicate::{NotForContentType, Predicate, SizeAbove};
 use tower_http::compression::CompressionLayer;
+use tower_http::compression::predicate::{NotForContentType, Predicate, SizeAbove};
 
-use crate::config::WebTransport;
+use crate::ControlMessage;
 use crate::SharedStreamState;
+use crate::config::WebTransport;
 use crate::frame::{FrameEvent, FrameKind};
 use crate::telemetry::Telemetry;
-use crate::ControlMessage;
 
 const INDEX_HTML: &str = r#"<!doctype html>
 <html>
@@ -42,7 +43,6 @@ const INDEX_HTML: &str = r#"<!doctype html>
   <style>
     :root {
       --bg: #000;
-      --disc: #d8d8d8;
       --g0: rgb(160, 255, 160);
       --g1: rgb(0, 195, 0);
       --g2: rgb(0, 170, 0);
@@ -51,42 +51,25 @@ const INDEX_HTML: &str = r#"<!doctype html>
       --g5: rgb(0, 20, 0);
     }
     body { margin: 0; background: var(--bg); color: var(--g1); font-family: monospace; }
-    .wrap { position: relative; width: 100vw; height: 100vh; overflow: hidden; }
+    .wrap { position: relative; width: 100vw; height: 100svh; overflow: hidden; }
     #matrix {
       margin: 0;
       display: block;
       width: 100%;
       height: 100%;
     }
-    #disc { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; color: var(--disc); font-size: 22px; }
-    #stats {
-      position: absolute;
-      left: 0;
-      right: 0;
-      bottom: 0;
-      display: none;
-      padding: 2px 8px;
-      color: #d0d0d0;
-      background: rgba(0, 0, 0, 0.45);
-      font-size: 13px;
-      line-height: 1.1;
-      white-space: nowrap;
-      text-align: right;
-    }
   </style>
 </head>
 <body>
   <div class="wrap">
     <canvas id="matrix" data-on:mousedown="window.__matrixDatastar.onClick(evt)"></canvas>
-    <div id="stats"></div>
-    <div id="disc">[ Disconnected ]</div>
     <div
       id="ds"
-      data-signals="{frameId: 0, speed: 16, sentMs: 0, connected: false, packedB64: '', cols: Math.max(1, Math.ceil(window.innerWidth / 10)), rows: Math.max(1, Math.ceil(window.innerHeight / 20)), width: Math.max(1, Math.ceil(window.innerWidth / 10)), height: Math.max(1, Math.ceil(window.innerHeight / 20))}"
-      data-init="@patch('/events', {cols: $cols, rows: $rows})"
+      data-signals="{frameId: 0, speed: 16, sentMs: 0, connected: false, packedB64: '', clientId: (window.crypto && window.crypto.randomUUID ? window.crypto.randomUUID() : ('c-' + Math.random().toString(36).slice(2))), cols: Math.max(1, Math.ceil(window.innerWidth / 10)), rows: Math.max(1, Math.floor((window.visualViewport ? window.visualViewport.height : window.innerHeight) / 20)), width: Math.max(1, Math.ceil(window.innerWidth / 10)), height: Math.max(1, Math.floor((window.visualViewport ? window.visualViewport.height : window.innerHeight) / 20))}"
+      data-init="@patch('/events', {clientId: $clientId, cols: $cols, rows: $rows})"
       data-effect="window.__matrixDatastar.onFrame($frameId, $speed, $sentMs, $packedB64, $width, $height)"
       data-on:keydown__window="window.__matrixDatastar.onKey(evt)"
-      data-on:resize__window__debounce.500ms="$cols = Math.max(1, Math.ceil(window.innerWidth / 10)); $rows = Math.max(1, Math.ceil(window.innerHeight / 20)); $width = $cols; $height = $rows; window.__matrixDatastar.onResize($cols, $rows)"
+      data-on:resize__window__debounce.500ms="$cols = Math.max(1, Math.ceil(window.innerWidth / 10)); $rows = Math.max(1, Math.floor((window.visualViewport ? window.visualViewport.height : window.innerHeight) / 20)); $width = $cols; $height = $rows; window.__matrixDatastar.onResize($clientId, $cols, $rows)"
     ></div>
   </div>
   <script>
@@ -99,9 +82,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
     ];
     const matrix = document.getElementById('matrix');
     const ctx = matrix.getContext('2d', { alpha: false, desynchronized: true });
-    const stats = document.getElementById('stats');
-    const disc = document.getElementById('disc');
+    const SIGNAL_LOST_ART = ['<<< [ SIGNAL LOST ] >>>'];
     let timeoutHandle;
+    let disconnected = false;
     let showStats = false;
     let lastFrameId = 0;
     let lastRenderedFrame = 0;
@@ -116,34 +99,71 @@ const INDEX_HTML: &str = r#"<!doctype html>
     let canvasDpr = 0;
     let lastResizeCols = 0;
     let lastResizeRows = 0;
+    let lastViewportW = 0;
+    let lastViewportH = 0;
+    const lastStatsRect = { x: 0, y: 0, w: 0 };
+
+    function viewportCols() {
+      return Math.max(1, lastViewportW || Math.ceil(window.innerWidth / CELL_W));
+    }
+
+    function viewportRows() {
+      const vh = (window.visualViewport ? window.visualViewport.height : window.innerHeight);
+      return Math.max(1, lastViewportH || Math.floor(vh / CELL_H));
+    }
 
     function scheduleDisconnect() {
       clearTimeout(timeoutHandle);
-      timeoutHandle = setTimeout(() => { disc.style.display = 'flex'; }, 3000);
+      timeoutHandle = setTimeout(() => {
+        disconnected = true;
+        const width = viewportCols();
+        const height = viewportRows();
+        renderSignalLost(width, height);
+      }, 3000);
     }
 
-    function renderStats(frameId, speed, sentMs) {
-      if (showStats) {
-        const now = performance.now();
-        if (frameId > lastFrameId && now - fpsLastAt >= 400) {
-          fps = (frameId - fpsLastFrame) / ((now - fpsLastAt) / 1000.0);
-          fpsLastFrame = frameId;
-          fpsLastAt = now;
-        }
-        const nowWall = Date.now();
-        const oneWay = Math.max(0, nowWall - sentMs);
-        latencySamples.push({ t: nowWall, v: oneWay });
-        while (latencySamples.length && (nowWall - latencySamples[0].t) > 250) latencySamples.shift();
-        let latencyMs = 0;
-        if (latencySamples.length) {
-          const total = latencySamples.reduce((acc, s) => acc + s.v, 0);
-          latencyMs = total / latencySamples.length;
-        }
-        stats.style.display = 'block';
-        stats.textContent = `frames:${frameId}  fps:${fps.toFixed(1)}  latency:${latencyMs.toFixed(1)}ms  speed:${speed}`;
-      } else {
-        stats.style.display = 'none';
+    function buildStatsText(frameId, speed, sentMs) {
+      if (!showStats) return '';
+      const now = performance.now();
+      if (frameId > lastFrameId && now - fpsLastAt >= 400) {
+        fps = (frameId - fpsLastFrame) / ((now - fpsLastAt) / 1000.0);
+        fpsLastFrame = frameId;
+        fpsLastAt = now;
       }
+      const nowWall = Date.now();
+      const oneWay = Math.max(0, nowWall - sentMs);
+      latencySamples.push({ t: nowWall, v: oneWay });
+      while (latencySamples.length && (nowWall - latencySamples[0].t) > 250) latencySamples.shift();
+      let latencyMs = 0;
+      if (latencySamples.length) {
+        const total = latencySamples.reduce((acc, s) => acc + s.v, 0);
+        latencyMs = total / latencySamples.length;
+      }
+      return `[ latency:${latencyMs.toFixed(1)}ms  speed:${speed}  frame:${frameId}  fps:${fps.toFixed(1)} ]`;
+    }
+
+    function drawStatsOverlay(text, width, height) {
+      if (!ctx || !width || !height) return;
+      if (lastStatsRect.w > 0) {
+        ctx.fillStyle = '#000';
+        ctx.fillRect(lastStatsRect.x * CELL_W, lastStatsRect.y * CELL_H, lastStatsRect.w * CELL_W, CELL_H);
+        lastStatsRect.w = 0;
+      }
+      if (!text) return;
+      const x0 = Math.max(0, width - text.length);
+      const y = Math.max(0, height - 1);
+      ctx.fillStyle = '#000';
+      ctx.fillRect(x0 * CELL_W, y * CELL_H, text.length * CELL_W, CELL_H);
+      ctx.fillStyle = 'rgb(160,255,160)';
+      for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        if (ch !== ' ') {
+          ctx.fillText(ch, (x0 + i) * CELL_W, y * CELL_H);
+        }
+      }
+      lastStatsRect.x = x0;
+      lastStatsRect.y = y;
+      lastStatsRect.w = text.length;
     }
 
     function classFromLum(lum) {
@@ -163,7 +183,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       return out;
     }
 
-    function setupCanvas(width, height) {
+    function ensureCanvasSize(width, height) {
       const dpr = window.devicePixelRatio || 1;
       if (width !== canvasW || height !== canvasH || dpr !== canvasDpr) {
         matrix.width = Math.max(1, Math.floor(width * CELL_W * dpr));
@@ -178,8 +198,52 @@ const INDEX_HTML: &str = r#"<!doctype html>
         canvasH = height;
         canvasDpr = dpr;
       }
+    }
+
+    function clearCanvas(width, height) {
       ctx.fillStyle = '#000';
       ctx.fillRect(0, 0, width * CELL_W, height * CELL_H);
+    }
+
+    function renderSignalLost(width, height) {
+      if (!ctx || !width || !height) return;
+      ensureCanvasSize(width, height);
+      const artH = SIGNAL_LOST_ART.length;
+      const artW = SIGNAL_LOST_ART.reduce((m, row) => Math.max(m, row.length), 0);
+      const startX = Math.floor((width - artW) / 2);
+      const startY = Math.floor((height - artH) / 2);
+      const margin = 1;
+      const blankX = Math.max(0, startX - margin);
+      const blankY = Math.max(0, startY - margin);
+      const blankW = Math.min(width - blankX, artW + margin * 2);
+      const blankH = Math.min(height - blankY, artH + margin * 2);
+      ctx.fillStyle = '#000';
+      ctx.fillRect(blankX * CELL_W, blankY * CELL_H, blankW * CELL_W, blankH * CELL_H);
+
+      for (let y = 0; y < artH; y++) {
+        const row = SIGNAL_LOST_ART[y];
+        let leftAngleSeen = 0;
+        let rightAngleSeen = 0;
+        for (let x = 0; x < row.length; x++) {
+          const ch = row[x];
+          if (ch !== ' ') {
+            if (ch === '[' || ch === ']') {
+              ctx.fillStyle = 'rgb(160,255,160)';
+            } else if (ch === '<') {
+              const shades = ['rgb(0,95,0)', 'rgb(0,145,0)', 'rgb(0,195,0)'];
+              ctx.fillStyle = shades[Math.min(leftAngleSeen, shades.length - 1)];
+              leftAngleSeen += 1;
+            } else if (ch === '>') {
+              const shades = ['rgb(0,195,0)', 'rgb(0,145,0)', 'rgb(0,95,0)'];
+              ctx.fillStyle = shades[Math.min(rightAngleSeen, shades.length - 1)];
+              rightAngleSeen += 1;
+            } else {
+              ctx.fillStyle = 'rgb(0,195,0)';
+            }
+            ctx.fillText(ch, (startX + x) * CELL_W, (startY + y) * CELL_H);
+          }
+        }
+      }
     }
 
     function renderCanvas(packedB64, width, height, frameId) {
@@ -187,7 +251,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
         return;
       }
       if (frameId <= lastRenderedFrame) return;
-      setupCanvas(width, height);
+      ensureCanvasSize(width, height);
+      clearCanvas(width, height);
       const packed = decodePacked(packedB64);
       const needed = width * height * 2;
       if (packed.length < needed) return;
@@ -220,10 +285,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
         sentMs = Number(sentMs || 0);
         width = Number(width || 0);
         height = Number(height || 0);
+        disconnected = false;
         renderCanvas(packedB64 || '', width, height, frameId);
+        drawStatsOverlay(buildStatsText(frameId, speed, sentMs), viewportCols(), viewportRows());
         scheduleDisconnect();
-        disc.style.display = 'none';
-        renderStats(frameId, speed, sentMs);
         lastFrameId = frameId;
         lastSpeed = speed;
         lastSentMs = sentMs;
@@ -234,7 +299,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
         };
         if (evt.key === '?') {
           showStats = !showStats;
-          renderStats(lastFrameId, lastSpeed, lastSentMs);
+          const width = viewportCols();
+          const height = viewportRows();
+          drawStatsOverlay(buildStatsText(lastFrameId, lastSpeed, lastSentMs), width, height);
         } else if (evt.key === ' ') {
           evt.preventDefault();
           sendControl('toggle_pause');
@@ -246,16 +313,24 @@ const INDEX_HTML: &str = r#"<!doctype html>
           sendControl('reset_speed');
         }
       },
-      onResize(cols, rows) {
+      onResize(clientId, cols, rows) {
         cols = Number(cols || 1);
         rows = Number(rows || 1);
         if (cols === lastResizeCols && rows === lastResizeRows) return;
         lastResizeCols = cols;
         lastResizeRows = rows;
+        lastViewportW = cols;
+        lastViewportH = rows;
+        ensureCanvasSize(cols, rows);
+        if (disconnected) {
+          renderSignalLost(cols, rows);
+        } else {
+          drawStatsOverlay(buildStatsText(lastFrameId, lastSpeed, lastSentMs), cols, rows);
+        }
         fetch('/cmd/resize', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ cols, rows }),
+          body: JSON.stringify({ clientId, cols, rows }),
         }).catch(() => {});
       },
       onClick(evt) {
@@ -285,6 +360,45 @@ struct AppState {
     shared: Arc<SharedStreamState>,
     telemetry: Arc<Telemetry>,
     shutdown: CancellationToken,
+    resize_tracker: Arc<ResizeTracker>,
+}
+
+#[derive(Default)]
+struct ResizeTracker {
+    clients: Mutex<HashMap<String, (u16, u16)>>,
+}
+
+impl ResizeTracker {
+    fn set_client_viewport(&self, client_id: &str, cols: u16, rows: u16) -> (u16, u16) {
+        let mut clients = self.clients.lock().unwrap_or_else(|e| e.into_inner());
+        clients.insert(client_id.to_string(), (cols.max(1), rows.max(1)));
+        max_dimensions(&clients)
+    }
+
+    fn remove_client(&self, client_id: &str) -> (u16, u16) {
+        let mut clients = self.clients.lock().unwrap_or_else(|e| e.into_inner());
+        clients.remove(client_id);
+        max_dimensions(&clients)
+    }
+}
+
+fn max_dimensions(clients: &HashMap<String, (u16, u16)>) -> (u16, u16) {
+    clients
+        .values()
+        .fold((0u16, 0u16), |(max_w, max_h), (w, h)| {
+            (max_w.max(*w), max_h.max(*h))
+        })
+}
+
+fn normalize_client_id(client_id: Option<String>) -> Option<String> {
+    client_id.and_then(|id| {
+        let id = id.trim();
+        if id.is_empty() {
+            None
+        } else {
+            Some(id.to_string())
+        }
+    })
 }
 
 pub struct WebTask {
@@ -402,7 +516,10 @@ fn generate_dev_tls_pem() -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
         "ironhide.local".to_string(),
     ];
     let cert = generate_simple_self_signed(names).context("failed to generate dev tls cert")?;
-    Ok((cert.cert.pem().into_bytes(), cert.key_pair.serialize_pem().into_bytes()))
+    Ok((
+        cert.cert.pem().into_bytes(),
+        cert.key_pair.serialize_pem().into_bytes(),
+    ))
 }
 
 pub async fn spawn_server(
@@ -436,6 +553,7 @@ pub async fn spawn_server(
         }),
         telemetry,
         shutdown: shutdown.clone(),
+        resize_tracker: Arc::new(ResizeTracker::default()),
     };
     let compression_predicate = SizeAbove::default()
         .and(NotForContentType::GRPC)
@@ -450,7 +568,10 @@ pub async fn spawn_server(
 
     let tls_config = match &transport {
         WebTransport::Http => None,
-        WebTransport::HttpsProvided { cert_path, key_path } => {
+        WebTransport::HttpsProvided {
+            cert_path,
+            key_path,
+        } => {
             ensure_rustls_provider();
             Some(
                 RustlsConfig::from_pem_file(cert_path.clone(), key_path.clone())
@@ -477,8 +598,8 @@ pub async fn spawn_server(
     let handle = tokio::spawn(async move {
         match transport {
             WebTransport::Http => {
-                let listener =
-                    TcpListener::from_std(std_listener).context("failed to create tokio listener")?;
+                let listener = TcpListener::from_std(std_listener)
+                    .context("failed to create tokio listener")?;
                 axum::serve(listener, app)
                     .with_graceful_shutdown(shutdown.cancelled_owned())
                     .await
@@ -522,39 +643,65 @@ async fn events_datastar(
     State(state): State<AppState>,
     Query(viewport): Query<ViewportQuery>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
-    events_datastar_inner(state, viewport.cols, viewport.rows)
+    events_datastar_inner(state, viewport.client_id, viewport.cols, viewport.rows)
 }
 
 async fn events_datastar_patch(
     State(state): State<AppState>,
     Json(viewport): Json<ViewportBody>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
-    events_datastar_inner(state, viewport.cols, viewport.rows)
+    events_datastar_inner(state, viewport.client_id, viewport.cols, viewport.rows)
 }
 
 fn events_datastar_inner(
     state: AppState,
+    client_id: Option<String>,
     cols: Option<u16>,
     rows: Option<u16>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    let client_id = normalize_client_id(client_id);
     if let (Some(cols), Some(rows)) = (cols, rows) {
-        let _ = state.shared.resize_tx.send((cols.max(1), rows.max(1)));
+        if let Some(client_id) = client_id.as_deref() {
+            let (max_w, max_h) =
+                state
+                    .resize_tracker
+                    .set_client_viewport(client_id, cols.max(1), rows.max(1));
+            let _ = state.shared.resize_tx.send((max_w, max_h));
+        } else {
+            let _ = state.shared.resize_tx.send((cols.max(1), rows.max(1)));
+        }
     }
     state.telemetry.inc_clients();
     let mut rx = state.shared.tx.subscribe();
     let latest = state.shared.latest.clone();
     let telemetry = state.telemetry.clone();
     let shutdown = state.shutdown.clone();
+    let resize_tracker = state.resize_tracker.clone();
+    let resize_tx = state.shared.resize_tx.clone();
 
     let stream = stream! {
-        struct ClientGuard(Arc<Telemetry>);
+        struct ClientGuard {
+            telemetry: Arc<Telemetry>,
+            resize_tracker: Arc<ResizeTracker>,
+            resize_tx: mpsc::UnboundedSender<(u16, u16)>,
+            client_id: Option<String>,
+        }
         impl Drop for ClientGuard {
             fn drop(&mut self) {
-                self.0.dec_clients();
+                self.telemetry.dec_clients();
+                if let Some(client_id) = self.client_id.as_deref() {
+                    let (max_w, max_h) = self.resize_tracker.remove_client(client_id);
+                    let _ = self.resize_tx.send((max_w, max_h));
+                }
             }
         }
 
-        let _guard = ClientGuard(telemetry.clone());
+        let _guard = ClientGuard {
+            telemetry: telemetry.clone(),
+            resize_tracker: resize_tracker.clone(),
+            resize_tx: resize_tx.clone(),
+            client_id: client_id.clone(),
+        };
         let mut first = true;
         let mut last_frame = 0u64;
         let mut glyph_buffer: Vec<u8> = Vec::new();
@@ -622,14 +769,29 @@ async fn cmd(
         }
         "resize" => {
             if let Some(Json(CmdBody::Resize(vp))) = body {
-                let _ = state.shared.resize_tx.send((vp.cols.max(1), vp.rows.max(1)));
+                if let Some(client_id) = normalize_client_id(vp.client_id) {
+                    let (max_w, max_h) = state.resize_tracker.set_client_viewport(
+                        &client_id,
+                        vp.cols.max(1),
+                        vp.rows.max(1),
+                    );
+                    let _ = state.shared.resize_tx.send((max_w, max_h));
+                } else {
+                    let _ = state
+                        .shared
+                        .resize_tx
+                        .send((vp.cols.max(1), vp.rows.max(1)));
+                }
             }
         }
         "glitch" => {
             if let Some(Json(CmdBody::Glitch(glitch))) = body {
                 let latest = state.shared.latest.read().await.clone();
                 let (x, y) = clamp_glitch_to_frame(glitch, &latest);
-                let _ = state.shared.control_tx.send(ControlMessage::Glitch { x, y });
+                let _ = state
+                    .shared
+                    .control_tx
+                    .send(ControlMessage::Glitch { x, y });
             }
         }
         _ => {}
@@ -639,12 +801,16 @@ async fn cmd(
 
 #[derive(Debug, serde::Deserialize)]
 struct ViewportQuery {
+    #[serde(rename = "clientId")]
+    client_id: Option<String>,
     cols: Option<u16>,
     rows: Option<u16>,
 }
 
 #[derive(Debug, serde::Deserialize)]
 struct ViewportBody {
+    #[serde(rename = "clientId")]
+    client_id: Option<String>,
     cols: Option<u16>,
     rows: Option<u16>,
 }
@@ -658,6 +824,8 @@ enum CmdBody {
 
 #[derive(Debug, serde::Deserialize)]
 struct ResizeBody {
+    #[serde(rename = "clientId")]
+    client_id: Option<String>,
     cols: u16,
     rows: u16,
 }
@@ -684,8 +852,7 @@ mod tests {
         }
     }
 
-    fn test_shared_state(
-    ) -> (
+    fn test_shared_state() -> (
         broadcast::Sender<FrameEvent>,
         Arc<RwLock<FrameEvent>>,
         mpsc::UnboundedSender<(u16, u16)>,
@@ -735,7 +902,8 @@ mod tests {
 
     #[test]
     fn browser_markup_contains_disconnect_and_binary_parser_checks() {
-        assert!(INDEX_HTML.contains("[ Disconnected ]"));
+        assert!(INDEX_HTML.contains("const SIGNAL_LOST_ART = ["));
+        assert!(INDEX_HTML.contains("<<< [ SIGNAL LOST ] >>>"));
         assert!(INDEX_HTML.contains("data-effect=\"window.__matrixDatastar.onFrame($frameId, $speed, $sentMs, $packedB64, $width, $height)\""));
         assert!(INDEX_HTML.contains("data-init=\"@patch('/events'"));
         assert!(INDEX_HTML.contains("datastar.js"));
@@ -744,7 +912,8 @@ mod tests {
     #[test]
     fn browser_markup_contains_stale_and_disconnect_logic() {
         assert!(INDEX_HTML.contains("if (frameId <= lastRenderedFrame) return;"));
-        assert!(INDEX_HTML.contains("setTimeout(() => { disc.style.display = 'flex'; }, 3000)"));
+        assert!(INDEX_HTML.contains("renderSignalLost(width, height);"));
+        assert!(INDEX_HTML.contains("const margin = 1;"));
     }
 
     #[test]

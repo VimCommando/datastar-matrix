@@ -1,25 +1,27 @@
 use std::io::{self, Stdout};
-use std::time::{Duration, Instant};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use crossterm::ExecutableCommand;
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseButton,
+    MouseEventKind,
+};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, size,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::Alignment;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Paragraph;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
+use crate::ControlMessage;
 use crate::frame::{FrameEvent, FrameKind};
 use crate::telemetry::Telemetry;
-use crate::ControlMessage;
 
 pub fn initial_terminal_size() -> (u16, u16) {
     current_terminal_size().unwrap_or((120, 40))
@@ -125,18 +127,22 @@ fn run_loop(
             if show_overlay {
                 let (clients, frames, _drops) = telemetry.snapshot();
                 let text = format!(
-                    " clients:{clients}  frames:{frames}  fps:{:.1}  speed:{} ",
-                    fps, current_speed
+                    "[ clients:{clients}  speed:{}  frame:{frames}  fps:{:.1} ]",
+                    current_speed, fps
                 );
                 let y = area.y + area.height.saturating_sub(1);
+                let text_width = text.chars().count() as u16;
+                let overlay_x = area.x + area.width.saturating_sub(text_width);
+                let line = Line::from(vec![Span::styled(
+                    text,
+                    Style::default().fg(Color::Rgb(180, 255, 180)),
+                )]);
                 f.render_widget(
-                    Paragraph::new(text)
-                        .style(Style::default().fg(Color::White))
-                        .alignment(Alignment::Right),
+                    Paragraph::new(line),
                     ratatui::layout::Rect {
-                        x: area.x,
+                        x: overlay_x,
                         y,
-                        width: area.width,
+                        width: text_width.min(area.width),
                         height: 1,
                     },
                 );
@@ -199,7 +205,12 @@ fn apply_luminance(frame: &FrameEvent, lum_buffer: &mut Vec<u8>) {
     }
 }
 
-fn build_gradient_lines(grid: &[char], lum_buffer: &[u8], width: u16, height: u16) -> Vec<Line<'static>> {
+fn build_gradient_lines(
+    grid: &[char],
+    lum_buffer: &[u8],
+    width: u16,
+    height: u16,
+) -> Vec<Line<'static>> {
     if width == 0 || height == 0 || grid.is_empty() {
         return Vec::new();
     }
@@ -218,10 +229,7 @@ fn build_gradient_lines(grid: &[char], lum_buffer: &[u8], width: u16, height: u1
             } else {
                 Color::Rgb(0, green, 0)
             };
-            spans.push(Span::styled(
-                ch.to_string(),
-                Style::default().fg(fg),
-            ));
+            spans.push(Span::styled(ch.to_string(), Style::default().fg(fg)));
         }
         lines.push(Line::from(spans));
     }

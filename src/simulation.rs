@@ -138,7 +138,10 @@ impl Simulation {
 
     pub fn queue_glitch(&mut self, x: u16, y: u16) {
         if self.pending_glitch.is_none() {
-            self.pending_glitch = Some((x.min(self.width.saturating_sub(1)), y.min(self.height.saturating_sub(1))));
+            self.pending_glitch = Some((
+                x.min(self.width.saturating_sub(1)),
+                y.min(self.height.saturating_sub(1)),
+            ));
         }
     }
 
@@ -209,7 +212,9 @@ impl Simulation {
             }
             FrameKind::Delta => {
                 for idx in 0..self.grid_glyph.len() {
-                    if self.grid_glyph[idx] != self.prev_glyph[idx] || self.grid_lum[idx] != self.prev_lum[idx] {
+                    if self.grid_glyph[idx] != self.prev_glyph[idx]
+                        || self.grid_lum[idx] != self.prev_lum[idx]
+                    {
                         cells.push(CellUpdate {
                             x: (idx % self.width as usize) as u16,
                             y: (idx / self.width as usize) as u16,
@@ -250,10 +255,12 @@ impl Simulation {
                     / (RIPPLE_DURATION_MS - RIPPLE_BRIGHT_HOLD_MS);
                 (1.0 - tail).clamp(0.0, 1.0)
             };
-            let min_x = (ripple.origin_x as i32 - (radius + RIPPLE_BAND_WIDTH).ceil() as i32).max(0);
+            let min_x =
+                (ripple.origin_x as i32 - (radius + RIPPLE_BAND_WIDTH).ceil() as i32).max(0);
             let max_x = (ripple.origin_x as i32 + (radius + RIPPLE_BAND_WIDTH).ceil() as i32)
                 .min(self.width as i32 - 1);
-            let min_y = (ripple.origin_y as i32 - (radius + RIPPLE_BAND_WIDTH).ceil() as i32).max(0);
+            let min_y =
+                (ripple.origin_y as i32 - (radius + RIPPLE_BAND_WIDTH).ceil() as i32).max(0);
             let max_y = (ripple.origin_y as i32 + (radius + RIPPLE_BAND_WIDTH).ceil() as i32)
                 .min(self.height as i32 - 1);
 
@@ -283,7 +290,8 @@ impl Simulation {
                     };
                     self.grid_lum[idx] = lum;
 
-                    let replace_p = RIPPLE_GLYPH_BASE_PROB + (RIPPLE_GLYPH_MAX_PROB - RIPPLE_GLYPH_BASE_PROB) * strength;
+                    let replace_p = RIPPLE_GLYPH_BASE_PROB
+                        + (RIPPLE_GLYPH_MAX_PROB - RIPPLE_GLYPH_BASE_PROB) * strength;
                     if rng.random_bool(replace_p as f64) {
                         self.grid_glyph[idx] = sample_glyph_index(rng);
                     }

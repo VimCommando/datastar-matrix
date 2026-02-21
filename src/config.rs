@@ -62,7 +62,10 @@ impl Config {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WebTransport {
     Http,
-    HttpsProvided { cert_path: PathBuf, key_path: PathBuf },
+    HttpsProvided {
+        cert_path: PathBuf,
+        key_path: PathBuf,
+    },
     HttpsAuto,
 }
 
@@ -93,7 +96,7 @@ mod tests {
             "--server",
             "--insecure",
         ])
-            .expect("parse should work");
+        .expect("parse should work");
         assert_eq!(cfg.target_fps, 30.0);
         assert_eq!(cfg.port, Some(8123));
         assert!(cfg.server);
@@ -113,20 +116,12 @@ mod tests {
     #[cfg(feature = "web")]
     #[test]
     fn secure_mode_rejects_partial_tls_flags() {
-        let cert_only = Config::try_parse_from([
-            "datastar-matrix",
-            "--tls-cert",
-            "cert.pem",
-        ])
-        .expect("parse should work");
+        let cert_only = Config::try_parse_from(["datastar-matrix", "--tls-cert", "cert.pem"])
+            .expect("parse should work");
         assert!(cert_only.web_transport().is_err());
 
-        let key_only = Config::try_parse_from([
-            "datastar-matrix",
-            "--tls-key",
-            "key.pem",
-        ])
-        .expect("parse should work");
+        let key_only = Config::try_parse_from(["datastar-matrix", "--tls-key", "key.pem"])
+            .expect("parse should work");
         assert!(key_only.web_transport().is_err());
     }
 
