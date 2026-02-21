@@ -62,14 +62,17 @@ const INDEX_HTML: &str = r#"<!doctype html>
 </head>
 <body>
   <div class="wrap">
-    <canvas id="matrix" data-on:mousedown="window.__matrixDatastar.onClick(evt)"></canvas>
+    <canvas
+      id="matrix"
+      data-on:mousedown="$x = window.__matrixDatastar.glitchCoord(evt, 'x'); $y = window.__matrixDatastar.glitchCoord(evt, 'y'); @post('/cmd/glitch')"
+    ></canvas>
     <div
       id="ds"
-      data-signals="{frameId: 0, speed: 16, sentMs: 0, connected: false, packedB64: '', clientId: (window.crypto && window.crypto.randomUUID ? window.crypto.randomUUID() : ('c-' + Math.random().toString(36).slice(2))), cols: Math.max(1, Math.ceil(window.innerWidth / 10)), rows: Math.max(1, Math.floor((window.visualViewport ? window.visualViewport.height : window.innerHeight) / 20)), width: Math.max(1, Math.ceil(window.innerWidth / 10)), height: Math.max(1, Math.floor((window.visualViewport ? window.visualViewport.height : window.innerHeight) / 20))}"
+      data-signals="{frameId: 0, speed: 16, sentMs: 0, connected: false, packedB64: '', clientId: (window.crypto && window.crypto.randomUUID ? window.crypto.randomUUID() : ('c-' + Math.random().toString(36).slice(2))), cols: Math.max(1, Math.ceil(window.innerWidth / 10)), rows: Math.max(1, Math.floor((window.visualViewport ? window.visualViewport.height : window.innerHeight) / 20)), width: Math.max(1, Math.ceil(window.innerWidth / 10)), height: Math.max(1, Math.floor((window.visualViewport ? window.visualViewport.height : window.innerHeight) / 20)), x: 0, y: 0}"
       data-init="@patch('/events', {clientId: $clientId, cols: $cols, rows: $rows})"
       data-effect="window.__matrixDatastar.onFrame($frameId, $speed, $sentMs, $packedB64, $width, $height)"
-      data-on:keydown__window="window.__matrixDatastar.onKey(evt)"
-      data-on:resize__window__debounce.500ms="$cols = Math.max(1, Math.ceil(window.innerWidth / 10)); $rows = Math.max(1, Math.floor((window.visualViewport ? window.visualViewport.height : window.innerHeight) / 20)); $width = $cols; $height = $rows; window.__matrixDatastar.onResize($clientId, $cols, $rows)"
+      data-on:keydown__window="if (evt.key === '?') { window.__matrixDatastar.toggleStats(); } else if (evt.key === ' ') { evt.preventDefault(); @post('/cmd/toggle_pause', {contentType: 'form'}); } else if (evt.key === '+' || evt.key === '=') { @post('/cmd/speed_up', {contentType: 'form'}); } else if (evt.key === '-' || evt.key === '_') { @post('/cmd/speed_down', {contentType: 'form'}); } else if (evt.key === '0') { @post('/cmd/reset_speed', {contentType: 'form'}); }"
+      data-on:resize__window__debounce.500ms="$cols = Math.max(1, Math.ceil(window.innerWidth / 10)); $rows = Math.max(1, Math.floor((window.visualViewport ? window.visualViewport.height : window.innerHeight) / 20)); $width = $cols; $height = $rows; window.__matrixDatastar.onResize($cols, $rows); @post('/cmd/resize')"
     ></div>
   </div>
   <script>
@@ -293,27 +296,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
         lastSpeed = speed;
         lastSentMs = sentMs;
       },
-      onKey(evt) {
-        const sendControl = (op) => {
-          fetch(`/cmd/${op}`, { method: 'POST' }).catch(() => {});
-        };
-        if (evt.key === '?') {
-          showStats = !showStats;
-          const width = viewportCols();
-          const height = viewportRows();
-          drawStatsOverlay(buildStatsText(lastFrameId, lastSpeed, lastSentMs), width, height);
-        } else if (evt.key === ' ') {
-          evt.preventDefault();
-          sendControl('toggle_pause');
-        } else if (evt.key === '+' || evt.key === '=') {
-          sendControl('speed_up');
-        } else if (evt.key === '-' || evt.key === '_') {
-          sendControl('speed_down');
-        } else if (evt.key === '0') {
-          sendControl('reset_speed');
-        }
+      toggleStats() {
+        showStats = !showStats;
+        const width = viewportCols();
+        const height = viewportRows();
+        drawStatsOverlay(buildStatsText(lastFrameId, lastSpeed, lastSentMs), width, height);
       },
-      onResize(clientId, cols, rows) {
+      onResize(cols, rows) {
         cols = Number(cols || 1);
         rows = Number(rows || 1);
         if (cols === lastResizeCols && rows === lastResizeRows) return;
@@ -327,13 +316,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
         } else {
           drawStatsOverlay(buildStatsText(lastFrameId, lastSpeed, lastSentMs), cols, rows);
         }
-        fetch('/cmd/resize', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ clientId, cols, rows }),
-        }).catch(() => {});
       },
-      onClick(evt) {
+      glitchCoord(evt, axis) {
         const rect = matrix.getBoundingClientRect();
         const px = evt.clientX - rect.left;
         const py = evt.clientY - rect.top;
@@ -343,11 +327,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
         const maxY = Math.max(0, canvasH - 1);
         x = Math.max(0, Math.min(maxX, x));
         y = Math.max(0, Math.min(maxY, y));
-        fetch('/cmd/glitch', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ x, y }),
-        }).catch(() => {});
+        return axis === 'y' ? y : x;
       },
     };
     scheduleDisconnect();
@@ -559,6 +539,8 @@ pub async fn spawn_server(
         .and(NotForContentType::GRPC)
         .and(NotForContentType::IMAGES);
 
+    // CQRS transport split: commands are accepted on /cmd/* (204 ack),
+    // while observable UI/query state is streamed on /events as SSE.
     let app = Router::new()
         .route("/", get(index))
         .route("/events", get(events_datastar).patch(events_datastar_patch))
@@ -754,6 +736,8 @@ async fn cmd(
     Path(op): Path<String>,
     body: Option<Json<CmdBody>>,
 ) -> StatusCode {
+    // Command endpoint intentionally returns transport acknowledgement only.
+    // Clients observe resulting state changes through /events SSE updates.
     match op.as_str() {
         "toggle_pause" => {
             let _ = state.shared.control_tx.send(ControlMessage::TogglePause);
@@ -840,6 +824,7 @@ struct GlitchBody {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use tokio::time::{Duration, timeout};
 
     fn test_frame() -> FrameEvent {
         FrameEvent {
@@ -907,6 +892,40 @@ mod tests {
         assert!(INDEX_HTML.contains("data-effect=\"window.__matrixDatastar.onFrame($frameId, $speed, $sentMs, $packedB64, $width, $height)\""));
         assert!(INDEX_HTML.contains("data-init=\"@patch('/events'"));
         assert!(INDEX_HTML.contains("datastar.js"));
+    }
+
+    #[test]
+    fn browser_markup_uses_datastar_post_handlers_for_commands() {
+        assert!(INDEX_HTML.contains("data-on:keydown__window=\"if (evt.key === '?') { window.__matrixDatastar.toggleStats(); }"));
+        assert!(INDEX_HTML.contains("@post('/cmd/toggle_pause', {contentType: 'form'})"));
+        assert!(INDEX_HTML.contains("@post('/cmd/speed_up', {contentType: 'form'})"));
+        assert!(INDEX_HTML.contains("@post('/cmd/speed_down', {contentType: 'form'})"));
+        assert!(INDEX_HTML.contains("@post('/cmd/reset_speed', {contentType: 'form'})"));
+        assert!(INDEX_HTML.contains("@post('/cmd/resize')"));
+        assert!(INDEX_HTML.contains("@post('/cmd/glitch')"));
+        assert!(!INDEX_HTML.contains("fetch('/cmd/"));
+        assert!(!INDEX_HTML.contains("fetch(`/cmd/"));
+    }
+
+    #[test]
+    fn browser_markup_keeps_cross_browser_fallbacks() {
+        assert!(INDEX_HTML.contains(
+            "window.crypto && window.crypto.randomUUID ? window.crypto.randomUUID() : ('c-' + Math.random().toString(36).slice(2))",
+        ));
+        assert!(INDEX_HTML.contains(
+            "window.visualViewport ? window.visualViewport.height : window.innerHeight",
+        ));
+        assert!(INDEX_HTML.contains("window.devicePixelRatio || 1"));
+    }
+
+    #[test]
+    fn browser_markup_keeps_transport_agnostic_renderer_wiring() {
+        assert!(INDEX_HTML.contains("data-init=\"@patch('/events'"));
+        assert!(INDEX_HTML.contains("data-effect=\"window.__matrixDatastar.onFrame($frameId, $speed, $sentMs, $packedB64, $width, $height)\""));
+        assert!(INDEX_HTML.contains("@post('/cmd/resize')"));
+        assert!(INDEX_HTML.contains("@post('/cmd/glitch')"));
+        assert!(!INDEX_HTML.contains("@patch('https://"));
+        assert!(!INDEX_HTML.contains("@patch('http://"));
     }
 
     #[test]
@@ -1004,6 +1023,118 @@ mod tests {
 
         task.shutdown.cancel();
         let _ = task.handle.await.expect("task join should succeed");
+    }
+
+    #[tokio::test]
+    async fn cmd_endpoint_acknowledges_without_state_payload() {
+        let token = CancellationToken::new();
+        let telemetry = Arc::new(Telemetry::default());
+        let (tx, latest, resize_tx, control_tx) = test_shared_state();
+        let task = spawn_server(
+            token.clone(),
+            Some(0),
+            false,
+            WebTransport::Http,
+            tx,
+            latest,
+            resize_tx,
+            control_tx,
+            telemetry,
+        )
+        .await
+        .expect("http spawn should work");
+
+        let client = reqwest::Client::builder()
+            .build()
+            .expect("client should build");
+
+        let supported = client
+            .post(format!("http://127.0.0.1:{}/cmd/speed_up", task.port))
+            .send()
+            .await
+            .expect("supported command should respond");
+        assert_eq!(supported.status(), StatusCode::NO_CONTENT);
+        let supported_body = supported
+            .bytes()
+            .await
+            .expect("supported body should read");
+        assert!(supported_body.is_empty());
+
+        let unknown = client
+            .post(format!("http://127.0.0.1:{}/cmd/not-a-real-op", task.port))
+            .send()
+            .await
+            .expect("unknown command should respond");
+        assert_eq!(unknown.status(), StatusCode::NO_CONTENT);
+        let unknown_body = unknown.bytes().await.expect("unknown body should read");
+        assert!(unknown_body.is_empty());
+
+        let events = client
+            .get(format!(
+                "http://127.0.0.1:{}/events?cols=4&rows=4",
+                task.port
+            ))
+            .send()
+            .await
+            .expect("events should remain available after commands");
+        assert!(events.status().is_success());
+        let content_type = events
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(content_type.starts_with("text/event-stream"));
+        drop(events);
+
+        task.shutdown.cancel();
+        let _ = task.handle.await.expect("task join should succeed");
+    }
+
+    #[tokio::test]
+    async fn rapid_commands_are_acked_and_enqueued_in_order() {
+        let (tx, _rx) = broadcast::channel(8);
+        let latest = Arc::new(RwLock::new(test_frame()));
+        let (resize_tx, _resize_rx) = mpsc::unbounded_channel();
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let state = AppState {
+            shared: Arc::new(SharedStreamState {
+                tx,
+                latest,
+                resize_tx,
+                control_tx,
+            }),
+            telemetry: Arc::new(Telemetry::default()),
+            shutdown: CancellationToken::new(),
+            resize_tracker: Arc::new(ResizeTracker::default()),
+        };
+
+        let a = cmd(State(state.clone()), Path("speed_up".to_string()), None).await;
+        let b = cmd(State(state.clone()), Path("speed_down".to_string()), None).await;
+        let c = cmd(State(state.clone()), Path("reset_speed".to_string()), None).await;
+
+        assert_eq!(a, StatusCode::NO_CONTENT);
+        assert_eq!(b, StatusCode::NO_CONTENT);
+        assert_eq!(c, StatusCode::NO_CONTENT);
+
+        let m1 = control_rx.recv().await.expect("first command must enqueue");
+        let m2 = control_rx.recv().await.expect("second command must enqueue");
+        let m3 = control_rx.recv().await.expect("third command must enqueue");
+        assert!(matches!(m1, ControlMessage::Speed(1)));
+        assert!(matches!(m2, ControlMessage::Speed(-1)));
+        assert!(matches!(m3, ControlMessage::ResetSpeed));
+
+        let u = cmd(
+            State(state),
+            Path("not-a-real-op".to_string()),
+            None,
+        )
+        .await;
+        assert_eq!(u, StatusCode::NO_CONTENT);
+        let extra = timeout(Duration::from_millis(20), control_rx.recv()).await;
+        assert!(
+            !matches!(extra, Ok(Some(_))),
+            "unknown command must not enqueue control messages"
+        );
     }
 
     #[tokio::test]
