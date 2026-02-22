@@ -2,8 +2,7 @@
 
 A realtime multiplayer, shared simulation of the matrix digital rain; simulitaneously rendered in the terminal and the browser.
 
-[<img width="1496" height="938" alt="Matrix" src="https://github.com/user-attachments/assets/69e1e052-8f5c-4714-bf88-dff249c29daa" />
-](https://youtu.be/r1ZfELi6a4g)
+[![Thumbnail](/datastar-matrix-play.png)](https://youtu.be/r1ZfELi6a4g)
 
 ## What this is
 
