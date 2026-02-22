@@ -2,7 +2,8 @@
 
 A realtime multiplayer, shared simulation of the matrix digital rain; simulitaneously rendered in the terminal and the browser.
 
-<iframe width="560" height="315" src="https://www.youtube-nocookie.com/embed/r1ZfELi6a4g?si=v3PyXaueOsErElMF" title="YouTube video player" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>
+[<img width="1496" height="938" alt="Matrix" src="https://github.com/user-attachments/assets/69e1e052-8f5c-4714-bf88-dff249c29daa" />
+](https://youtu.be/r1ZfELi6a4g)
 
 ## What this is
 
