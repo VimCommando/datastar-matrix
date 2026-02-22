@@ -106,7 +106,7 @@ fn run_loop(
                     }
                 }
                 Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                    telemetry.add_drops(n as u64);
+                    telemetry.add_drops(n);
                     continue;
                 }
                 Err(broadcast::error::TryRecvError::Empty) => break,

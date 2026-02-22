@@ -1,1 +1,10 @@
 /target
+.codex
+.DS_Store
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
+*.swp
+*.swo

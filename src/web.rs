@@ -502,6 +502,7 @@ fn generate_dev_tls_pem() -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn spawn_server(
     token: CancellationToken,
     requested_port: Option<u16>,
@@ -719,7 +720,7 @@ fn events_datastar_inner(
                             last_frame = frame.frame_id;
                         }
                         Err(broadcast::error::RecvError::Lagged(n)) => {
-                            telemetry.add_drops(n as u64);
+                            telemetry.add_drops(n);
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
                     }
@@ -826,6 +827,13 @@ mod tests {
     use std::path::PathBuf;
     use tokio::time::{Duration, timeout};
 
+    type TestSharedState = (
+        broadcast::Sender<FrameEvent>,
+        Arc<RwLock<FrameEvent>>,
+        mpsc::UnboundedSender<(u16, u16)>,
+        mpsc::UnboundedSender<ControlMessage>,
+    );
+
     fn test_frame() -> FrameEvent {
         FrameEvent {
             frame_id: 0,
@@ -837,12 +845,7 @@ mod tests {
         }
     }
 
-    fn test_shared_state() -> (
-        broadcast::Sender<FrameEvent>,
-        Arc<RwLock<FrameEvent>>,
-        mpsc::UnboundedSender<(u16, u16)>,
-        mpsc::UnboundedSender<ControlMessage>,
-    ) {
+    fn test_shared_state() -> TestSharedState {
         let (tx, _rx) = broadcast::channel(8);
         let latest = Arc::new(RwLock::new(test_frame()));
         let (resize_tx, _resize_rx) = mpsc::unbounded_channel();
@@ -912,9 +915,11 @@ mod tests {
         assert!(INDEX_HTML.contains(
             "window.crypto && window.crypto.randomUUID ? window.crypto.randomUUID() : ('c-' + Math.random().toString(36).slice(2))",
         ));
-        assert!(INDEX_HTML.contains(
-            "window.visualViewport ? window.visualViewport.height : window.innerHeight",
-        ));
+        assert!(
+            INDEX_HTML.contains(
+                "window.visualViewport ? window.visualViewport.height : window.innerHeight",
+            )
+        );
         assert!(INDEX_HTML.contains("window.devicePixelRatio || 1"));
     }
 
@@ -1054,10 +1059,7 @@ mod tests {
             .await
             .expect("supported command should respond");
         assert_eq!(supported.status(), StatusCode::NO_CONTENT);
-        let supported_body = supported
-            .bytes()
-            .await
-            .expect("supported body should read");
+        let supported_body = supported.bytes().await.expect("supported body should read");
         assert!(supported_body.is_empty());
 
         let unknown = client
@@ -1117,18 +1119,16 @@ mod tests {
         assert_eq!(c, StatusCode::NO_CONTENT);
 
         let m1 = control_rx.recv().await.expect("first command must enqueue");
-        let m2 = control_rx.recv().await.expect("second command must enqueue");
+        let m2 = control_rx
+            .recv()
+            .await
+            .expect("second command must enqueue");
         let m3 = control_rx.recv().await.expect("third command must enqueue");
         assert!(matches!(m1, ControlMessage::Speed(1)));
         assert!(matches!(m2, ControlMessage::Speed(-1)));
         assert!(matches!(m3, ControlMessage::ResetSpeed));
 
-        let u = cmd(
-            State(state),
-            Path("not-a-real-op".to_string()),
-            None,
-        )
-        .await;
+        let u = cmd(State(state), Path("not-a-real-op".to_string()), None).await;
         assert_eq!(u, StatusCode::NO_CONTENT);
         let extra = timeout(Duration::from_millis(20), control_rx.recv()).await;
         assert!(

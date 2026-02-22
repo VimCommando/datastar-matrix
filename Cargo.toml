@@ -2,6 +2,12 @@
 name = "datastar-matrix"
 version = "0.1.0"
 edition = "2024"
+description = "Matrix digital rain in terminal and browser using Rust, Axum SSE, and Datastar."
+license = "MIT"
+repository = "https://github.com/VimCommando/datastar-matrix"
+readme = "README.md"
+keywords = ["datastar", "rust", "sse", "terminal", "matrix"]
+categories = ["command-line-utilities", "web-programming"]
 
 [features]
 default = ["web"]

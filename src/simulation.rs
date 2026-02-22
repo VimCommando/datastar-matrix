@@ -308,7 +308,7 @@ impl Simulation {
     }
 
     fn random_column(height: u16, rng: &mut impl Rng) -> Column {
-        let len = rng.random_range(4..=height.max(4).min(32));
+        let len = rng.random_range(4..=height.clamp(4, 32));
         let stride = rng.random_range(1..=4);
         let head = -rng.random_range(0..height as i32);
         Column { head, len, stride }
